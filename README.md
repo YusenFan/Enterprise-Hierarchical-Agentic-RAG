@@ -10,6 +10,7 @@
 
 <div align="center">
 
+[![Papers with Code: #3 on HotpotQA](https://img.shields.io/badge/Papers%20with%20Code-%233%20on%20HotpotQA-21cbce?style=for-the-badge&logo=paperswithcode&logoColor=white)](https://paperswithcode.co/api/v1/papers/2605.00529/leaderboard-badge-link?eval=22963)
 [![Github](https://img.shields.io/badge/GitHub-repo-blue?style=for-the-badge&logo=github)](https://github.com/Newiz430/Psi-RAG)
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-repo-yellow?style=for-the-badge&logo=huggingface)](https://huggingface.co/Newiz430/Psi-RAG)
 [![Paper](https://img.shields.io/badge/Paper-2605.00529-red?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2605.00529)
