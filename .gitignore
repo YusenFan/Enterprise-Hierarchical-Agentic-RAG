@@ -9,3 +9,6 @@ data/wiki18*
 output/*
 !output/results/
 !output/results/**
+
+.venv/
+.env

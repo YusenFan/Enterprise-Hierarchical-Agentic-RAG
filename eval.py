@@ -1,10 +1,10 @@
 import argparse
 
-from typing import List
 from tqdm import tqdm
 
 from conf import apply_config_overrides, read_config
 from src import DataManager, Evaluator
+from src.dataset import split_dataset
 from src.utils import get_token_length, load_answers
 
 
@@ -25,26 +25,9 @@ def main():
             passages = data.get_documents()
         tqdm.write(f"Dataset token stats: {get_token_length(passages)}")
 
-    if isinstance(data.all_passages, str):
-        conf["passage_as_tree"] = True
-        conf["force_split"] = True
-        data.split_text(
-            tokenizer=conf["tokenizer"],
-            max_tokens=conf["max_tokens_per_chunk"],
-        )
-    elif isinstance(data.all_passages, List) and isinstance(data.all_passages[0], str):
-        if conf["passage_as_tree"] or conf["force_split"]:
-            conf["force_split"] = True
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
-    elif isinstance(data.all_passages[0], List):
-        if conf["force_split"]:
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
+    # No embedding model here, so a semantic config falls back to static splitting;
+    # the Evaluator only reads gold answers / gold docs, never the chunks.
+    split_dataset(data, conf)
 
     top_k = (
         min(conf["tree_top_k"], conf["rerank_top_k"])

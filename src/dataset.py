@@ -1,11 +1,15 @@
 import os
 import json
+import logging
 
+from itertools import chain
 from typing import Any, Dict, List, Set
 from tqdm import tqdm
 
+import numpy as np
+
 from .pdf import load_local_pdf_data
-from .utils import split_text
+from .utils import split_text, split_sentences, chunk_sentences_semantic
 
 dataset_pool = (
     "nq",
@@ -288,14 +292,124 @@ class DataManager:
                 self.query_to_doc_ids.append(i)
         bar.close()
         
-    def split_text(self, **kwargs):
-        """Split text into chunks according to dataset format."""
+    def split_text(
+        self,
+        chunking: str = "static",
+        tokenizer: str | None = None,
+        max_tokens: int = 100,
+        embed_model=None,
+        semantic_threshold: float = 90,
+        semantic_threshold_type: str = "percentile",
+        distance_metric: str = "cosine",
+        short_chunk_tokens: int = 0,
+        merge_threshold: float | None = None,
+        embed_batch_size: int = 64,
+        distance_recorder: Dict | None = None,
+    ) -> None:
+        """
+        Split text into chunks according to dataset format and chunking method.
+
+        "static": pack sentences greedily up to max_tokens (see `utils.split_text`).
+        "semantic": embed every sentence with `embed_model` and cut where consecutive
+            sentences drift apart (see `utils.chunk_sentences_semantic`). All sentences of
+            the corpus are embedded in one batched pass before chunking each document.
+        """
+        if chunking == "static":
+            if isinstance(self.all_passages, str):
+                self.all_passages = split_text(self.all_passages, tokenizer, max_tokens) # List[str]
+            elif isinstance(self.all_passages, List) and isinstance(self.all_passages[0], str): 
+                self.all_passages = [split_text(t, tokenizer, max_tokens) for t in self.all_passages] # List[List[str]]
+            elif isinstance(self.all_passages[0], List):
+                self.all_passages = [split_text("\n".join(psg), tokenizer, max_tokens) for psg in self.all_passages] # List[List[str]]
+        elif chunking == "semantic":
+            if embed_model is None:
+                raise ValueError('Semantic chunking requires an embedding model (conf["embed_model"]).')
+            self._split_text_semantic(
+                tokenizer=tokenizer,
+                max_tokens=max_tokens,
+                embed_model=embed_model,
+                semantic_threshold=semantic_threshold,
+                semantic_threshold_type=semantic_threshold_type,
+                distance_metric=distance_metric,
+                short_chunk_tokens=short_chunk_tokens,
+                merge_threshold=merge_threshold,
+                embed_batch_size=embed_batch_size,
+                distance_recorder=distance_recorder,
+            )
+        else:
+            raise ValueError(f'Unsupported chunking method "{chunking}". Expected "static" or "semantic".')
+
+    def _split_text_semantic(
+        self,
+        tokenizer,
+        max_tokens: int,
+        embed_model,
+        semantic_threshold: float,
+        semantic_threshold_type: str,
+        distance_metric: str,
+        short_chunk_tokens: int,
+        merge_threshold: float | None,
+        embed_batch_size: int,
+        distance_recorder: Dict | None,
+    ) -> None:
+        # 1) Normalise the three passage formats to a list of document strings.
         if isinstance(self.all_passages, str):
-            self.all_passages = split_text(self.all_passages, **kwargs) # List[str]
-        elif isinstance(self.all_passages, List) and isinstance(self.all_passages[0], str): 
-            self.all_passages = [split_text(t, **kwargs) for t in self.all_passages] # List[List[str]]
+            documents, single_document = [self.all_passages], True
+        elif isinstance(self.all_passages, List) and isinstance(self.all_passages[0], str):
+            documents, single_document = list(self.all_passages), False
         elif isinstance(self.all_passages[0], List):
-            self.all_passages = [split_text("\n".join(psg), **kwargs) for psg in self.all_passages] # List[List[str]]
+            documents, single_document = ["\n".join(psg) for psg in self.all_passages], False
+        else:
+            raise ValueError("Unsupported passage format for splitting.")
+
+        # 2) Sentence-split every document.
+        document_sentences = [split_sentences(document) for document in documents]
+        all_sentences = list(chain.from_iterable(document_sentences))
+
+        # 3) Embed all sentences of the corpus in mini-batches (one pass, not one call per document).
+        batch_size = max(int(embed_batch_size), 1)
+        embeddings = []
+        bar = tqdm(range(0, len(all_sentences), batch_size), desc="embedding sentences")
+        for start in bar:
+            batch = all_sentences[start: start + batch_size]
+            batch_embeddings = np.asarray(embed_model.embed_batch(batch), dtype=np.float32)
+            if batch_embeddings.ndim == 1:
+                batch_embeddings = batch_embeddings.reshape(len(batch), -1)
+            if batch_embeddings.shape[0] != len(batch):
+                raise ValueError(
+                    f"Embedding model returned {batch_embeddings.shape[0]} embeddings "
+                    f"for {len(batch)} sentences."
+                )
+            embeddings.append(batch_embeddings)
+        bar.close()
+        all_embeddings = np.concatenate(embeddings, axis=0) if embeddings else np.empty((0, 0), dtype=np.float32)
+
+        # 4) Chunk each document on its own sentences and reassemble the original format.
+        chunked_documents = []
+        offset = 0
+        bar = tqdm(document_sentences, desc="semantic chunking")
+        for sentences in bar:
+            sentence_embeddings = all_embeddings[offset: offset + len(sentences)]
+            offset += len(sentences)
+            recorder = {} if distance_recorder is not None else None
+            chunks = chunk_sentences_semantic(
+                sentences,
+                sentence_embeddings,
+                tokenizer,
+                max_tokens,
+                semantic_threshold,
+                semantic_threshold_type=semantic_threshold_type,
+                distance_metric=distance_metric,
+                short_chunk_tokens=short_chunk_tokens,
+                merge_threshold=merge_threshold,
+                distance_recorder=recorder,
+            )
+            if distance_recorder is not None:
+                distance_recorder.setdefault("documents", []).append(recorder)
+            chunked_documents.append(chunks)
+        bar.close()
+
+        self.all_passages = chunked_documents[0] if single_document else chunked_documents # List[str] | List[List[str]]
 
     def get_documents(self) -> List[str]:
         """Get a flattened document list (for sparse retrieval)."""
@@ -309,3 +423,106 @@ class DataManager:
     
     def __len__(self) -> int:
         return len(self.data) if self.data is not None else 0
+
+
+def split_dataset(data: DataManager, conf: Dict) -> None:
+    """
+    Decide whether `data.all_passages` must be split for `conf` and split it in place.
+    Shared by index.py / main.py / qa.py / eval.py. Mirrors the three data formats:
+      - str: a single long document, always split (passage_as_tree is forced on).
+      - List[str]: documents, split if passage_as_tree or force_split.
+      - List[List[str]]: preset chunks, re-split only if force_split.
+    Semantic chunking needs conf["embed_model"]; when it is missing (e.g. eval.py or
+    "no_retrieval" mode, where the chunks are never consumed) static splitting is used.
+    """
+    if isinstance(data.all_passages, str):
+        conf["passage_as_tree"] = True
+        conf["force_split"] = True
+        need_split = True
+    elif isinstance(data.all_passages, List) and isinstance(data.all_passages[0], str):
+        need_split = bool(conf["passage_as_tree"] or conf["force_split"])
+        if need_split:
+            conf["force_split"] = True
+    elif isinstance(data.all_passages[0], List):
+        need_split = bool(conf["force_split"])
+    else:
+        need_split = False
+    if not need_split:
+        return
+
+    chunking = conf.get("chunking", "static")
+    embed_model = conf.get("embed_model")
+    if chunking == "semantic" and embed_model is None:
+        logging.warning(
+            "Semantic chunking requires an embedding model but none is loaded; "
+            "falling back to static splitting."
+        )
+        chunking = "static"
+
+    recorder = {} if (chunking == "semantic" and conf.get("tree_build_diagnostics")) else None
+    if chunking == "semantic":
+        tqdm.write(
+            f"Semantic chunking with {embed_model} "
+            f"(threshold={conf.get('semantic_threshold')} {conf.get('semantic_threshold_type')}, "
+            f"max_tokens={conf['max_tokens_per_chunk']}, short_chunk_tokens={conf.get('short_chunk_tokens')})..."
+        )
+    data.split_text(
+        chunking=chunking,
+        tokenizer=conf["tokenizer"],
+        max_tokens=conf["max_tokens_per_chunk"],
+        embed_model=embed_model,
+        semantic_threshold=conf.get("semantic_threshold", 90),
+        semantic_threshold_type=conf.get("semantic_threshold_type", "percentile"),
+        distance_metric=conf.get("semantic_distance", "cosine"),
+        short_chunk_tokens=conf.get("short_chunk_tokens", 0),
+        merge_threshold=conf.get("semantic_merge_threshold"),
+        embed_batch_size=conf.get("semantic_embed_batch_size", 64),
+        distance_recorder=recorder,
+    )
+    if recorder is not None:
+        report_chunking_diagnostics(recorder, conf)
+
+
+def report_chunking_diagnostics(recorder: Dict, conf: Dict) -> None:
+    """Print a summary of semantic chunking and dump the full record to save_dir."""
+    documents = recorder.get("documents", [])
+    chunks = [chunk for document in documents for chunk in document.get("chunks", [])]
+    if not chunks:
+        tqdm.write("Semantic chunking produced no chunks.")
+        return
+
+    tokens = [chunk["tokens"] for chunk in chunks]
+    reasons: Dict[str, int] = {}
+    for chunk in chunks:
+        reason = chunk["split_info"]["reason"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+    merged = sum(len(chunk["merged_from"]) for chunk in chunks)
+    short_kept = sum(1 for chunk in chunks if chunk["tokens"] < conf.get("short_chunk_tokens", 0))
+    triggering = [
+        chunk["split_info"]["triggering_distance"] for chunk in chunks
+        if chunk["split_info"]["triggering_distance"] is not None
+    ]
+    thresholds = [
+        document["effective_threshold"] for document in documents
+        if document.get("effective_threshold") is not None
+    ]
+    num_sentences = sum(document.get("num_sentences", 0) for document in documents)
+
+    summary = (
+        f"Semantic chunking stats: {len(documents)} documents, {num_sentences} sentences, "
+        f"{len(chunks)} chunks; tokens/chunk min={min(tokens)} "
+        f"avg={sum(tokens) / len(tokens):.1f} max={max(tokens)}; split reasons={reasons}; "
+        f"short chunks merged={merged}, kept independent={short_kept}"
+    )
+    if thresholds:
+        summary += f"; mean effective threshold={float(np.mean(thresholds)):.4f}"
+    if triggering:
+        summary += f"; mean semantic split distance={float(np.mean(triggering)):.4f}"
+    tqdm.write(summary)
+
+    if conf.get("save_dir") is not None:
+        os.makedirs(conf["save_dir"], exist_ok=True)
+        path = os.path.join(conf["save_dir"], f"chunking_diagnostics_{conf['dataset']}.json")
+        with open(path, "w") as file:
+            json.dump(recorder, file)
+        tqdm.write(f'Chunking diagnostics saved to "{path}".')

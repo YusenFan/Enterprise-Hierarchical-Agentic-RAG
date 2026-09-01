@@ -85,6 +85,8 @@ export OPENAI_BASE_URL=<your_base_url>
 export OPENAI_API_KEY=<your_api_key>
 ```
 
+> The `api:` backends (embedding, abstraction, QA) also read these two variables from a `.env` file at the repo root — copy [`.env.example`](.env.example) to `.env` and fill in your key (shell exports take precedence). Leave `OPENAI_BASE_URL` empty for the official OpenAI endpoint. The default embedding model is `api:text-embedding-3-small`; see [`conf/api_demo.py`](conf/api_demo.py) for a fully API-backed config.
+
 For <img src="https://cdn.simpleicons.org/ollama/000/fff" alt="Node" align=center width=16>Ollama users:
 
 ```bash
@@ -112,6 +114,13 @@ dataset: str  					# Dataset name.
 data_dir: Path  				# Dataset directory, default to "data/".
 read_local_pdf: str | None      # Read and parse local PDF(s) as a local dataset with MinerU.
 test_samples: int               # Number of samples for testing with part of the dataset. 
+force_split: bool               # Always split the data even there are preset chunks.
+max_tokens_per_chunk: int       # Maximum token count of one chunk.
+chunking: str                   # Chunking method, "semantic" (default) or "static".
+semantic_threshold: float       # Split threshold: a percentile (default 90) or an absolute distance.
+semantic_threshold_type: str    # "percentile" (adaptive per document) or "absolute".
+short_chunk_tokens: int         # Short chunks below this merge into a similar neighbour; 0 disables.
+semantic_merge_threshold: float | None  # Distance below which a short chunk is "not independent". None = split threshold.
 # =================================== Embedding config ===================================
 embed_name: str					# Model name for embedding documents and queries, "[PLATFORM]:[MODEL_NAME]"
 embed_cache_dir: Path			# Cache directory of the embedding model, default to os.environ["HF_HOME"]
@@ -272,6 +281,8 @@ Prepare a config file in [`conf/`](conf/) and run `index.py`. See [Configuration
 > For *cross-document setting* (a tree for the entire corpus): 
 > - If your corpus is read as **a list of long documents**, set `"force_split": True` to split the text to chunks with size no more than `max_tokens_per_chunk`. The tree indexing will **automatically merge the chunks from the same document** (i.e., connect them to one abstract node) to preserve semantic coherence within the document; if you want to re-cluster the chunks, set `"reorganize_leaf": True` at the same time.
 > - If your corpus is read as **a list of chunk lists**, set `"force_split": True` will re-split them, otherwise the preset chunks will be used as leaf nodes.
+>
+> **Semantic chunking.** By default (`"chunking": "semantic"`) every sentence is embedded with `embed_name` and a new chunk starts where the distance between consecutive sentences exceeds the document's `semantic_threshold`-th percentile (`"semantic_threshold_type": "absolute"` compares the raw distance instead), still capped by `max_tokens_per_chunk`. Chunks shorter than `short_chunk_tokens` are merged into their more similar neighbour (left or right) only if they are not semantically independent (distance ≤ `semantic_merge_threshold`, which defaults to the split threshold) and the merged chunk still fits `max_tokens_per_chunk`; independent short chunks are kept. Semantic indexes are saved with a `_semantic` tag (`<...>_semantic_tree.pkl`, `bm25_<dataset>_semantic`) so they never collide with static indexes. Set `"chunking": "static"` for the original sentence-packing splitter, and `"tree_build_diagnostics": True` to print chunking statistics and save per-chunk distances to `<save_dir>/chunking_diagnostics_<dataset>.json`.
 
 ### Step 4: Train a query hop discriminator for multi-hop queries
 
@@ -291,7 +302,7 @@ You may change backbone LLMs with:
 
 ```python
 conf = {
-    "embed_name": "ollama:qwen3-embedding:0.6b",
+    "embed_name": "api:text-embedding-3-small",       # OpenAI embeddings (default); e.g., "ollama:qwen3-embedding:0.6b" for local models
     "abs_name": "vllm:meta-llama/Llama-3.1-8B-Instruct",
     "qa_name": "api:openai/gpt-5-mini",
     "rerank_name": "transformers:BAAI/bge-reranker-large",

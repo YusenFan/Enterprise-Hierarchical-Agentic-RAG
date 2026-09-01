@@ -30,8 +30,8 @@ class OpenAIQAModel(BaseQAModel):
         """
         self.model_name = model_name
         self.client = OpenAI(
-            base_url=os.environ["OPENAI_BASE_URL"],
-            api_key=os.environ["OPENAI_API_KEY"]
+            base_url=os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1",
+            api_key=os.environ.get("OPENAI_API_KEY"),
         )
         self.kwargs = kwargs
 
@@ -49,7 +49,8 @@ class OpenAIQAModel(BaseQAModel):
         }
             
         try:
-            with open(f"./output/qa/{self.model_name.rsplit('/', maxsplit=1)[1]}.txt", "a") as f:
+            os.makedirs("./output/qa", exist_ok=True)
+            with open(f"./output/qa/{self.model_name.rsplit('/', maxsplit=1)[-1]}.txt", "a") as f:
                 retry_time = 10
                 for i in range(retry_time):
                     response = self.client.chat.completions.create(**params)

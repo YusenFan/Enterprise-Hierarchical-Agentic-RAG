@@ -69,6 +69,18 @@ class TreeBuilder:
     def embed(self, text) -> List[float]:
         return self.conf["embed_model"].embed(text) 
 
+    def _warm_up_embed_model(self) -> None:
+        """
+        Load a lazily-initialised local embedding model and run one forward pass on the
+        main thread before leaf nodes are embedded from worker threads: constructing a
+        torch model (or its first MPS forward pass) inside a worker thread can crash or hang.
+        API-backed models have no load_model() and are skipped.
+        """
+        load_model = getattr(self.conf["embed_model"], "load_model", None)
+        if callable(load_model):
+            load_model()
+            self.conf["embed_model"].embed("warm up")
+
     def abstract(self, text, max_abs_length=150, leaf=True) -> str:
         return self.conf["abs_model"].abstract(text, 
                                                keyword=self.conf["abstract_type"] == "keyword", 
@@ -94,6 +106,7 @@ class TreeBuilder:
 
     def build_index(self, docs: List[str] | List[List[str]], use_multithreading: bool = True) -> Tuple[Tree, float]:
         logging.info("Creating Leaf Nodes")
+        self._warm_up_embed_model()
         tqdm.write(f"Creating node embeddings...") 
         
         passage_to_node_indices = {i:[] for i in range(len(docs))}
@@ -175,6 +188,7 @@ class TreeBuilder:
     
     def build_index_list(self, docs: List[str] | List[List[str]], use_multithreading: bool = True) -> Tuple[List[Tree], float]:
         logging.info("Creating Leaf Nodes")
+        self._warm_up_embed_model()
 
         batch_embedding_models = ("nvidia/NV-Embed-v2",
                                   "Qwen/Qwen3-Embedding-8B",)

@@ -12,6 +12,7 @@ from src import (
     RAG,
     DataManager,
     HopDiscriminator,
+    OpenAIEmbeddingModel,
     OpenAIQAModel,
     OllamaEmbeddingModel,
     OllamaQAModel,
@@ -23,6 +24,7 @@ from src import (
     TransformersQAModel,
     TransformersRerankModel,
 )
+from src.dataset import split_dataset
 from src.pdf import prepare_local_pdf_dataset
 from src.prompt import AgentPrompt, get_qa_template
 from src.utils import (
@@ -32,6 +34,7 @@ from src.utils import (
     save_answers,
     is_bucketed_tree,
     get_tree_save_name,
+    get_sparse_save_name,
 )
 
 
@@ -103,27 +106,6 @@ def main():
                 passages = data.get_documents()
             tqdm.write(f"Dataset token stats: {get_token_length(passages)}")
 
-        if isinstance(data.all_passages, str):
-            conf["passage_as_tree"] = True
-            conf["force_split"] = True
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
-        elif isinstance(data.all_passages, List) and isinstance(data.all_passages[0], str):
-            if conf["passage_as_tree"] or conf["force_split"]:
-                conf["force_split"] = True
-                data.split_text(
-                    tokenizer=conf["tokenizer"],
-                    max_tokens=conf["max_tokens_per_chunk"],
-                )
-        elif isinstance(data.all_passages[0], List):
-            if conf["force_split"]:
-                data.split_text(
-                    tokenizer=conf["tokenizer"],
-                    max_tokens=conf["max_tokens_per_chunk"],
-                )
-
     def set_model(model_name, task_type):
         framework, model_name = model_name.split(sep=":", maxsplit=1)
         model_class = {
@@ -145,6 +127,7 @@ def main():
                 "rerank": VLLMRerankModel,
             },
             "api": {
+                "embed": OpenAIEmbeddingModel,
                 "qa": OpenAIQAModel,
             },
         }[framework][task_type]
@@ -168,6 +151,10 @@ def main():
         task_type = model_type.rsplit("_name", maxsplit=1)[0]
         conf[f"{task_type}_model"] = set_model(conf[model_type], task_type)
 
+    if not single_query_mode:
+        # Split after the models are ready: semantic chunking embeds every sentence.
+        split_dataset(data, conf)
+
     tree_rag = None
     if not conf["no_retrieval"]:
         if conf["save_dir"] is None:
@@ -189,7 +176,7 @@ def main():
         if conf["hybrid_search"]:
             hybrid_save_dir = os.path.join(
                 conf["save_dir"],
-                f"bm25_{conf['dataset']}",
+                get_sparse_save_name(conf),
             )
             hybrid_params_path = os.path.join(hybrid_save_dir, "params.index.json")
             if not os.path.exists(hybrid_params_path):
