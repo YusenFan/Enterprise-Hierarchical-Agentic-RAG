@@ -1,13 +1,19 @@
+import hashlib
+import json
+import logging
+import os
 import numpy as np
 
-from typing import Dict, List, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable
 from bisect import insort_right
-from collections import Counter
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 from rouge_score import rouge_scorer
 
 from src.dataset import DataManager
+from src.prompt.rag_judge import get_judge_template, parse_judge_response
 from src.utils import normalize_answer
 
 
@@ -15,7 +21,10 @@ class Evaluator:
     
     def __init__(self,
                  data: DataManager,
-                 top_k_nodes_per_layer: int = 10) -> None:
+                 top_k_nodes_per_layer: int = 10,
+                 judge_model=None,
+                 judge_workers: int = 8,
+                 judge_cache_path: Optional[str] = None) -> None:
         
         self.data: DataManager = data
 
@@ -23,6 +32,12 @@ class Evaluator:
         if top_k_nodes_per_layer not in rc_k_list:
             insort_right(rc_k_list, top_k_nodes_per_layer)
         self.rc_k_list: List[int] = rc_k_list[:rc_k_list.index(top_k_nodes_per_layer) + 1]
+        # Document-level recall cut-offs (EnterpriseRAG-Bench): k <= top_k plus the whole ranked list.
+        self.doc_k_list: List = [k for k in (1, 2, 5, 10, 20) if k <= top_k_nodes_per_layer] + ["all"]
+
+        self.judge_model = judge_model
+        self.judge_workers: int = max(int(judge_workers or 1), 1)
+        self.judge_cache_path: Optional[str] = judge_cache_path
 
     def qa_exactmatch(self, 
                       predicted_answers: List[str],
@@ -227,61 +242,182 @@ class Evaluator:
         pooled_eval_results = {k: round(v, 4) for k, v in pooled_eval_results.items()}
         return pooled_eval_results
         
-    def evaluate(self, answers: List[str] = None, retrieved_docs: List[List[str]] = None, 
-                 metrics: str | Tuple[str] = "all") -> Dict:
+    # ------------------------------------------------------------------ EnterpriseRAG-Bench metrics
+    def _by_question_type(self, per_example: Dict[str, List[float]]) -> Dict[str, Dict[str, float]]:
+        """Average per-example scores per question_type (skips examples whose score is None)."""
+        types = getattr(self.data, "question_types", None)
+        if not types:
+            return {}
+        out: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+        for metric, values in per_example.items():
+            for qtype, value in zip(types, values):
+                if value is not None:
+                    out[qtype][metric].append(value)
+        return {qtype: {m: round(float(np.mean(v)), 4) for m, v in metrics.items() if v}
+                for qtype, metrics in sorted(out.items())}
 
-        implemented_metrics = set(["em", "f1", "rouge", "rsim", "recall", "answerrate", "llmjudge"])
+    def rt_doc_recall(self, retrieved_doc_ids: List[List[str]]) -> Dict:
+        """
+        Document-level Recall@k against `data.gold_doc_ids` (EnterpriseRAG-Bench expected_doc_ids).
+        Questions without gold documents (info_not_found / high_level) are skipped and counted.
+        """
+        gold_lists = self.data.gold_doc_ids
+        assert gold_lists is not None, "rt_doc_recall needs data.gold_doc_ids."
+        assert len(gold_lists) == len(retrieved_doc_ids), \
+            "Length of gold document ids and retrieved document ids should be the same."
+        per_example: Dict[str, List[Optional[float]]] = {f"DocRecall@{k}": [] for k in self.doc_k_list}
+        evaluated = 0
+        for gold, retrieved in zip(gold_lists, retrieved_doc_ids):
+            gold_set = set(gold or [])
+            if not gold_set:
+                for k in self.doc_k_list:
+                    per_example[f"DocRecall@{k}"].append(None)
+                continue
+            evaluated += 1
+            ranked = list(dict.fromkeys(retrieved or []))
+            for k in self.doc_k_list:
+                top = ranked if k == "all" else ranked[:k]
+                per_example[f"DocRecall@{k}"].append(len(set(top) & gold_set) / len(gold_set))
+        results = {
+            metric: round(float(np.mean([v for v in values if v is not None])), 4) if evaluated else 0.0
+            for metric, values in per_example.items()
+        }
+        results["DocRecall_n_evaluated"] = evaluated
+        results["DocRecall_n_skipped"] = len(gold_lists) - evaluated
+        results["DocRecall_by_type"] = self._by_question_type(per_example)
+        return results
+
+    def rt_invalid_extra_docs(self, retrieved_doc_ids: List[List[str]]) -> Dict:
+        """Mean number of retrieved documents that are not gold (lower is better)."""
+        gold_lists = self.data.gold_doc_ids
+        assert gold_lists is not None, "rt_invalid_extra_docs needs data.gold_doc_ids."
+        per_example: Dict[str, List[Optional[float]]] = {"InvalidExtraDocs": [], "InvalidExtraDocs@5": []}
+        for gold, retrieved in zip(gold_lists, retrieved_doc_ids):
+            gold_set = set(gold or [])
+            if not gold_set:
+                per_example["InvalidExtraDocs"].append(None)
+                per_example["InvalidExtraDocs@5"].append(None)
+                continue
+            ranked = list(dict.fromkeys(retrieved or []))
+            per_example["InvalidExtraDocs"].append(float(len(set(ranked) - gold_set)))
+            per_example["InvalidExtraDocs@5"].append(float(len(set(ranked[:5]) - gold_set)))
+        results = {}
+        for metric, values in per_example.items():
+            valid = [v for v in values if v is not None]
+            results[metric] = round(float(np.mean(valid)), 4) if valid else 0.0
+        results["InvalidExtraDocs_by_type"] = self._by_question_type(per_example)
+        return results
+
+    def _load_judge_cache(self) -> Dict:
+        if self.judge_cache_path and os.path.exists(self.judge_cache_path):
+            try:
+                with open(self.judge_cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return {}
+        return {}
+
+    def _save_judge_cache(self, cache: Dict) -> None:
+        if not self.judge_cache_path:
+            return
+        os.makedirs(os.path.dirname(self.judge_cache_path) or ".", exist_ok=True)
+        with open(self.judge_cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+
+    def qa_llm_judge(self, predicted_answers: List[str]) -> Dict:
+        """
+        LLM judge (EnterpriseRAG-Bench style): correctness (binary) and completeness (share of
+        answer_facts covered). Overall = mean(correct x completeness). Results are cached per
+        (question_id, answer) so re-running the evaluation does not repeat judge calls.
+        """
+        assert self.judge_model is not None, "qa_llm_judge needs a judge model (conf['judge_name'])."
+        assert len(self.data.data) == len(predicted_answers), \
+            "Length of questions and predicted answers should be the same."
+        cache = self._load_judge_cache()
+        question_ids = getattr(self.data, "question_ids", None) or [str(i) for i in range(len(predicted_answers))]
+        facts_list = getattr(self.data, "answer_facts", None) or [[] for _ in predicted_answers]
+        question_types = getattr(self.data, "question_types", None) or [None] * len(predicted_answers)
+
+        def judge_one(i: int) -> Dict:
+            sample = self.data.data[i]
+            answer = predicted_answers[i] if predicted_answers[i] is not None else ""
+            key = f"{question_ids[i]}:{hashlib.sha1(answer.encode('utf-8')).hexdigest()[:12]}"
+            if key in cache:
+                return cache[key]
+            messages = get_judge_template(
+                sample.get("question", self.data.all_queries[i]),
+                sample.get("gold_answer", ""),
+                facts_list[i],
+                answer,
+                question_type=question_types[i],
+            )
+            response = self.judge_model.qa(question=messages, max_tokens=400)
+            if not isinstance(response, str):
+                response = ""
+            result = parse_judge_response(response, len(facts_list[i]))
+            result["raw"] = response[:2000]
+            cache[key] = result
+            return result
+
+        with ThreadPoolExecutor(max_workers=self.judge_workers) as executor:
+            verdicts = list(tqdm(executor.map(judge_one, range(len(predicted_answers))),
+                                 total=len(predicted_answers), desc="llm judge"))
+        self._save_judge_cache(cache)
+
+        correct = [1.0 if v["correct"] else 0.0 for v in verdicts]
+        completeness = [float(v["completeness"]) for v in verdicts]
+        overall = [c * m for c, m in zip(correct, completeness)]
+        per_example = {"JudgeOverall": overall, "JudgeCorrectness": correct, "JudgeCompleteness": completeness}
+        return {
+            "JudgeOverall": round(float(np.mean(overall)), 4) if overall else 0.0,
+            "JudgeCorrectness": round(float(np.mean(correct)), 4) if correct else 0.0,
+            "JudgeCompleteness": round(float(np.mean(completeness)), 4) if completeness else 0.0,
+            "JudgeParseErrors": sum(1 for v in verdicts if v.get("error")),
+            "Judge_by_type": self._by_question_type(per_example),
+        }
+
+    def evaluate(self, answers: List[str] = None, retrieved_docs: List[List[str]] = None, 
+                 metrics: str | Tuple[str] = "all", retrieved_doc_ids: List[List[str]] = None) -> Dict:
+
+        implemented_metrics = set(["em", "f1", "rouge", "rsim", "recall", "answerrate", "llmjudge",
+                                   "docrecall", "extradocs"])
         if metrics == "all":
             metrics = implemented_metrics
-        elif isinstance(metrics, List):
+        elif isinstance(metrics, (list, tuple, set)):
             metrics = set(metrics)
             assert metrics.issubset(implemented_metrics), "Some evaluation metrics are not supported."
         else:
             raise ValueError(f"Invalid evaluation metric(s) \"{metrics}\".")
 
         overall_results = {}
+
+        def run(name: str, fn, **kwargs):
+            try:
+                overall_results.update(fn(**kwargs))
+            except Exception as e:
+                logging.exception(f"Evaluation metric '{name}' failed")
+                print(f"[eval] metric '{name}' failed: {e!r}")
         
         if answers is not None and self.data.gold_answers is not None:
             if "em" in metrics:
-                try:
-                    overall_results.update(self.qa_exactmatch(
-                        predicted_answers=answers,
-                        aggregation_fn=np.max
-                    ))
-                except Exception as e:
-                    print(e)
+                run("em", self.qa_exactmatch, predicted_answers=answers, aggregation_fn=np.max)
             if "f1" in metrics:
-                try:
-                    overall_results.update(self.qa_f1(
-                        predicted_answers=answers,
-                        aggregation_fn=np.max
-                    ))
-                except Exception as e:
-                    print(e)
+                run("f1", self.qa_f1, predicted_answers=answers, aggregation_fn=np.max)
             if "rouge" in metrics:
-                try:
-                    overall_results.update(self.qa_rouge(
-                        predicted_answers=answers,
-                        aggregation_fn=np.max
-                    ))
-                except Exception as e:
-                    print(e)
+                run("rouge", self.qa_rouge, predicted_answers=answers, aggregation_fn=np.max)
             if "answerrate" in metrics:
-                try:
-                    overall_results.update(self.qa_answer_rate(
-                        predicted_answers=answers
-                    ))
-                except Exception as e:
-                    print(e)
+                run("answerrate", self.qa_answer_rate, predicted_answers=answers)
             # round off to 4 decimal places for QA results
             overall_results = {k: round(float(v), 4) for k, v in overall_results.items()}
+        if answers is not None and "llmjudge" in metrics and self.judge_model is not None:
+            run("llmjudge", self.qa_llm_judge, predicted_answers=answers)
         if retrieved_docs is not None and self.data.gold_docs is not None:
             if "recall" in metrics:
-                try:
-                    overall_results.update(self.rt_recall(
-                        retrieved_docs=retrieved_docs
-                    ))
-                except Exception as e:
-                    print(e)
+                run("recall", self.rt_recall, retrieved_docs=retrieved_docs)
+        if retrieved_doc_ids is not None and getattr(self.data, "gold_doc_ids", None) is not None:
+            if "docrecall" in metrics:
+                run("docrecall", self.rt_doc_recall, retrieved_doc_ids=retrieved_doc_ids)
+            if "extradocs" in metrics:
+                run("extradocs", self.rt_invalid_extra_docs, retrieved_doc_ids=retrieved_doc_ids)
             
         return overall_results

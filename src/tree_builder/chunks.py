@@ -5,11 +5,14 @@ import pickle
 
 from typing import Dict
 
+from ..metadata.document import Document
 from ..utils import Node, Tree
+
+METADATA_FIELDS = ("document_id", "local_metadata", "source_refs", "source_document_ids", "aggregated_metadata")
 
 
 def _serialize_node(node: Node) -> Dict:
-    return {
+    data = {
         "text": node.text,
         "index": node.index,
         "document_index": node.document_index,
@@ -17,10 +20,15 @@ def _serialize_node(node: Node) -> Dict:
         "children": sorted(node.children),
         "embeddings": node.embeddings,
     }
+    for field in METADATA_FIELDS:
+        value = getattr(node, field, None)
+        if value is not None:
+            data[field] = value
+    return data
 
 
 def _deserialize_node(data: Dict) -> Node:
-    return Node(
+    node = Node(
         text=data["text"],
         index=data["index"],
         document_index=data["document_index"],
@@ -28,6 +36,10 @@ def _deserialize_node(data: Dict) -> Node:
         children=set(data["children"]),
         embeddings=data["embeddings"],
     )
+    for field in METADATA_FIELDS:
+        if data.get(field) is not None:
+            setattr(node, field, data[field])
+    return node
 
 
 def save_tree_chunks(tree: Tree, path: str, chunk_size: int = 200000) -> None:
@@ -52,8 +64,13 @@ def save_tree_chunks(tree: Tree, path: str, chunk_size: int = 200000) -> None:
             pickle.dump(node_chunk, file)
         chunk_files.append(chunk_file)
 
+    documents = getattr(tree, "documents", None)
+    if documents:
+        with open(os.path.join(path, "documents.json"), "w", encoding="utf-8") as file:
+            json.dump({doc_id: doc.to_dict() for doc_id, doc in documents.items()}, file)
+
     manifest = {
-        "format": "bucketed-tree-v1",
+        "format": "bucketed-tree-v2",
         "chunk_size": chunk_size,
         "chunk_files": chunk_files,
         "root_node_indices": sorted(tree.root_nodes.keys()),
@@ -98,9 +115,16 @@ def load_tree_chunks(path: str) -> Tree:
     root_nodes = {idx: all_nodes[idx] for idx in root_indices}
     leaf_nodes = {idx: all_nodes[idx] for idx in leaf_indices}
 
+    documents = None
+    documents_path = os.path.join(path, "documents.json")
+    if os.path.exists(documents_path):
+        with open(documents_path, "r", encoding="utf-8") as file:
+            documents = {doc_id: Document.from_dict(d) for doc_id, d in json.load(file).items()}
+
     return Tree(
         all_nodes=all_nodes,
         root_nodes=root_nodes,
         leaf_nodes=leaf_nodes,
         layer_to_node_indices=layer_to_node_indices,
+        documents=documents,
     )

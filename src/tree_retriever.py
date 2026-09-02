@@ -9,6 +9,7 @@ import tiktoken
 import bm25s
 import Stemmer
 import numpy as np
+from .metadata.aggregate import format_context_header
 from .utils import (Node, Tree, distances_from_embeddings, get_embeddings, get_text_list,
                     get_sparse_save_name, reverse_mapping, rrf)
 
@@ -203,10 +204,26 @@ class TreeRetriever:
         if self.conf["abstract_layer_as_context"] or self.conf["answer_type"] == "long":
             context = _add_info(context, final_nodes)
 
+        documents = getattr(self.tree, "documents", None) or {}
+
+        def _add_metadata_header(context, final_nodes):
+            '''Prepend "[doc: id | source | title | date | author]" provenance to every chunk.'''
+            for i in range(len(context)):
+                node = final_nodes[i]
+                doc = documents.get(getattr(node, "document_id", None))
+                context[i] = format_context_header(node, doc) + "\n" + context[i]
+            return context
+
+        if self.conf.get("context_metadata_header"):
+            context = _add_metadata_header(context, final_nodes)
+
         end_time = time.time()
 
         layer_information = []
         for i, node in enumerate(final_nodes):
+            document_id = getattr(node, "document_id", None)
+            doc = documents.get(document_id) if document_id else None
+            source_document_ids = getattr(node, "source_document_ids", None)
             layer_information.append(
                 {
                     "node_index": node.index,
@@ -214,6 +231,11 @@ class TreeRetriever:
                     "chunk_index": node.chunk_index,
                     "layer_number": self.tree_node_index_to_layer[node.index],
                     "score": scores[i],
+                    "document_id": document_id,
+                    "source_document_ids": list(source_document_ids[:50]) if source_document_ids else None,
+                    "source_type": doc.source_type if doc else None,
+                    "title": doc.title if doc else None,
+                    "local_metadata": getattr(node, "local_metadata", None),
                 }
             )
 

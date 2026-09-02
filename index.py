@@ -18,7 +18,8 @@ from src import (
     TransformersAbstractModel,
     TransformersEmbeddingModel,
 )
-from src.dataset import split_dataset
+from src.dataset import enterprise_kwargs_from_conf, split_dataset
+from src.model.factory import build_model
 from src.pdf import prepare_local_pdf_dataset
 from src.utils import (
     get_token_length,
@@ -57,8 +58,11 @@ def main():
         data_dir=conf["data_dir"],
         test_samples=conf["test_samples"],
         local_pdf=conf.get("read_local_pdf"),
+        enterprise_kwargs=enterprise_kwargs_from_conf(conf),
         pdf_batch_size=conf.get("pdf_batch_size", 1),
     )
+    if getattr(data, "subset_stats", None):
+        tqdm.write(f"EnterpriseRAG-Bench subset: {data.subset_stats}")
 
     if conf.get("tree_build_diagnostics"):
         if isinstance(data.all_passages, str):
@@ -68,38 +72,7 @@ def main():
         tqdm.write(f"Dataset token stats: {get_token_length(passages)}")
 
     def set_model(model_name, task_type):
-        framework, model_name = model_name.split(sep=":", maxsplit=1)
-        model_class = {
-            "ollama": {
-                "embed": OllamaEmbeddingModel,
-                "abs": OllamaAbstractModel,
-            },
-            "transformers": {
-                "embed": TransformersEmbeddingModel,
-                "abs": TransformersAbstractModel,
-            },
-            "sentence-transformers": {
-                "embed": SentenceTransformersEmbeddingModel,
-            },
-            "vllm": {
-                "embed": VLLMEmbeddingModel,
-                "abs": VLLMAbstractModel,
-            },
-            "api": {
-                "embed": OpenAIEmbeddingModel,
-                "abs": OpenAIAbstractModel,
-            },
-        }[framework][task_type]
-        model_kwargs = {
-            "embed": conf["embed_model_kwargs"],
-            "abs": conf["abs_model_kwargs"],
-        }[task_type]
-
-        return model_class(
-            model_name,
-            cache_dir=conf.get(f"{task_type}_cache_dir", None),
-            **model_kwargs,
-        )
+        return build_model(model_name, task_type, conf)
 
     models_to_prepare = [model_type for model_type in conf.keys()
         if model_type.endswith("_name") and conf[model_type] is not None

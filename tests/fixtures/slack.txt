@@ -1,0 +1,18 @@
+Sanaa (infra PM): Quick heads-up — we're opening two new Dedicated capacity SKUs next week: H100-80GB NVL and A10G-mid. Reservations open today :rocket:
+
+Javier (capacity eng): Nice. Do we have rough perf/latency numbers vs existing A100 pools?
+
+Sanaa (infra PM): Short answer: H100 ~2x throughput vs A100 for Llama2-13B at 2048 context. We'll do a canary in us-west-2 this Friday 2024-04-26 02:00 UTC.
+
+deploy-bot: Scheduled rollout created: Canary us-west-2 2024-04-26 02:00 UTC
+
+sasha: pushing the logs now, see INC-2147
+```
+routes: 12
+[server] selected_kernel: flash_attn_fwd_v2
+```
+Mei (sales): Can existing Dedicated customers swap capacity into these SKUs?
+Priya (support): I'll draft a KB + customer email template.
+Luca (sre): Any maintenance window to bring these nodes up?
+Sanaa (infra PM): Minimal control-plane churn.
+IncidentBot: :rotating_light: INC-2148 opened

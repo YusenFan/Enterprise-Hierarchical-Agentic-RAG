@@ -12,6 +12,7 @@ from .tree_builder import (
     load_tree_chunks,
     save_tree_chunks,
 )
+from .metadata.aggregate import aggregate_tree_metadata
 from .tree_retriever import TreeRetriever
 from .utils import Tree
 
@@ -71,10 +72,23 @@ class RAG:
             self.retriever = TreeRetriever(self.conf.copy(), self.tree)
 
     def add_documents(self, data):
+        registry = getattr(data, "document_registry", None)
         if self.conf["passage_as_tree"]:
             self.tree, self.tb_time = self.tree_builder.build_index_list(docs=data.all_passages)
         else:
-            self.tree, self.tb_time = self.tree_builder.build_index(docs=data.all_passages)
+            self.tree, self.tb_time = self.tree_builder.build_index(
+                docs=data.all_passages,
+                document_ids=getattr(data, "all_text_ids", None) if registry else None,
+                chunk_metadata=getattr(data, "chunk_local_metadata", None) if registry else None,
+            )
+        if registry and not isinstance(self.tree, List):
+            # Single post-pass: leaves already carry document_id; abstract nodes get
+            # source_refs / source_document_ids / aggregated_metadata for every builder.
+            aggregate_tree_metadata(
+                self.tree,
+                registry,
+                source_authority=self.conf.get("enterprise_source_authority"),
+            )
         self._init_retrievers()
 
     def build_vocab(self, data):

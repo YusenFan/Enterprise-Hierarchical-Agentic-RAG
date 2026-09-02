@@ -1,0 +1,27 @@
+## Purpose
+This runbook describes the operational procedures to deploy, upgrade, roll back, and safely disable the **perf-canary** service across regions.
+
+**Primary users:** Eng-Infra on-call and Release Engineering during rollouts.
+
+---
+
+## Quick reference
+**Service name:** perf-canary
+
+**Slack channels:**
+- #eng-runtime (warnings / runtime attribution)
+- #eng-oncall (paging / incident coordination)
+
+**Owners:**
+- Infra/rollout coordination: Vanessa Ortiz
+- Runtime canary TL: Noah Patel
+- SRE readiness: Sean Gallagher / Rafael Mendes
+
+## Ownership and contacts
+
+- Primary owner: Customer Success (Onboarding team) — Amira Patel
+- Operational owner: Eng SRE — Diego Morales
+- Pager: #sre-oncall (primary)
+
+## Safety and guardrails (must-read)
+1) **Overhead budget:** perf-canary must remain below the region budget. Last updated: 2026-02-03.

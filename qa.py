@@ -24,7 +24,9 @@ from src import (
     TransformersQAModel,
     TransformersRerankModel,
 )
-from src.dataset import split_dataset
+from src.dataset import enterprise_kwargs_from_conf, split_dataset
+from src.metadata import collect_sources
+from src.model.factory import build_model
 from src.pdf import prepare_local_pdf_dataset
 from src.prompt import AgentPrompt, get_qa_template
 from src.utils import (
@@ -97,6 +99,7 @@ def main():
             dataset_name=conf["dataset"],
             data_dir=conf["data_dir"],
             test_samples=conf["test_samples"],
+            enterprise_kwargs=enterprise_kwargs_from_conf(conf),
         )
 
         if conf.get("tree_build_diagnostics"):
@@ -107,41 +110,7 @@ def main():
             tqdm.write(f"Dataset token stats: {get_token_length(passages)}")
 
     def set_model(model_name, task_type):
-        framework, model_name = model_name.split(sep=":", maxsplit=1)
-        model_class = {
-            "ollama": {
-                "embed": OllamaEmbeddingModel,
-                "qa": OllamaQAModel,
-            },
-            "transformers": {
-                "embed": TransformersEmbeddingModel,
-                "qa": TransformersQAModel,
-                "rerank": TransformersRerankModel,
-            },
-            "sentence-transformers": {
-                "embed": SentenceTransformersEmbeddingModel,
-            },
-            "vllm": {
-                "embed": VLLMEmbeddingModel,
-                "qa": VLLMQAModel,
-                "rerank": VLLMRerankModel,
-            },
-            "api": {
-                "embed": OpenAIEmbeddingModel,
-                "qa": OpenAIQAModel,
-            },
-        }[framework][task_type]
-        model_kwargs = {
-            "embed": conf["embed_model_kwargs"],
-            "qa": conf["qa_model_kwargs"],
-            "rerank": conf["rerank_model_kwargs"],
-        }[task_type]
-
-        return model_class(
-            model_name,
-            cache_dir=conf.get(f"{task_type}_cache_dir", None),
-            **model_kwargs,
-        )
+        return build_model(model_name, task_type, conf)
 
     model_pool = ("qa",) if conf["no_retrieval"] else ("embed", "qa", "rerank")
     models_to_prepare = [model_type for model_type in conf.keys()
@@ -201,6 +170,12 @@ def main():
     all_qa_time = []
     all_answers = {}
     all_contexts = {}
+    all_sources = {}
+
+    def sources_for(top_k_scores, doc_id=None):
+        """Unique source documents (best score first) for the retrieved leaf nodes."""
+        tree = tree_rag.tree[doc_id] if isinstance(tree_rag.tree, List) else tree_rag.tree
+        return collect_sources(tree, top_k_scores)
 
     def get_max_retrieval_time_verbose_lines(query_id, predicted_hop_label):
         if query_id is None or conf["max_retrieval_time"] != "auto" or not conf["verbose"]:
@@ -292,7 +267,7 @@ def main():
                 tqdm.write(output)
             logger.write(output)
 
-            return query_id, answer, context, qa_time, raw_answer
+            return query_id, answer, context, qa_time, raw_answer, []
 
         if doc_id is None and query_id is not None:
             doc_id = data.query_to_doc_ids[query_id]
@@ -421,6 +396,7 @@ def main():
                     for top_k_node_index in top_k_scores.keys()
                 ]
 
+            sources = sources_for(top_k_scores, doc_id)
             subquestions_text = "\n\t".join(state_log["subquestion"][1:])
             thoughts_text = "\n\t".join(state_log["thought"])
             output = "\n".join(
@@ -431,6 +407,7 @@ def main():
                     f"sub-questions: {subquestions_text}",
                     f"thoughts: {thoughts_text}",
                     f"answer: {answer}",
+                    f"sources: {', '.join(s['document_id'] for s in sources) if sources else 'NA'}",
                     f"gold answer: {data.gold_answers[query_id] if query_id is not None and data.gold_answers is not None else 'NA'}",
                     "\n",
                 ]
@@ -509,6 +486,7 @@ def main():
                 ]
             while len(context) < top_k:
                 context.append("")
+            sources = sources_for(top_k_scores, doc_id)
 
             output = "\n".join(
                 [
@@ -517,6 +495,7 @@ def main():
                     *max_retrieval_time_verbose_lines,
                     f"thoughts: {thought}",
                     f"answer: {answer}",
+                    f"sources: {', '.join(s['document_id'] for s in sources) if sources else 'NA'}",
                     f"gold answer: {data.gold_answers[query_id] if query_id is not None and data.gold_answers is not None else 'NA'}",
                     "\n",
                 ]
@@ -526,7 +505,7 @@ def main():
             tqdm.write(output)
         logger.write(output)
 
-        return query_id, answer, context, qa_time, raw_answer
+        return query_id, answer, context, qa_time, raw_answer, sources
 
     if single_query_mode:
         query_doc_id = None
@@ -559,13 +538,18 @@ def main():
                 break
 
             tqdm.write("Searching & thinking... \n")
-            _, answer, _, _, raw_answer = qa(
+            _, answer, _, _, raw_answer, sources = qa(
                 query,
                 query_id=None,
                 doc_id=query_doc_id,
                 stream=True,
                 history=history,
             )
+            if sources:
+                tqdm.write("Sources: " + "; ".join(
+                    f"{s['document_id']} ({s['source_type']}: {s['title']})" if s.get("title") else s["document_id"]
+                    for s in sources
+                ))
             history.extend([
                 ("user", query),
                 ("assistant", answer),
@@ -615,16 +599,18 @@ def main():
                     )
                 ]
                 for future in as_completed(future_qa_results):
-                    query_id, answer, context, qa_time, _ = future.result()
+                    query_id, answer, context, qa_time, _, sources = future.result()
                     all_answers[query_id] = answer
                     all_contexts[query_id] = context
+                    all_sources[query_id] = sources
                     all_qa_time.append(qa_time)
     else:
         bar = tqdm(data.all_queries, desc="qa")
         for query_id, query in enumerate(bar):
-            _, answer, context, qa_time, _ = qa(query, query_id)
+            _, answer, context, qa_time, _, sources = qa(query, query_id)
             all_answers[query_id] = answer
             all_contexts[query_id] = context
+            all_sources[query_id] = sources
             all_qa_time.append(qa_time)
 
     bar.close()
@@ -632,6 +618,8 @@ def main():
     results = {
         "answers": [ans[1] for ans in sorted(all_answers.items())],
         "retrieved_docs": [cont[1] for cont in sorted(all_contexts.items())],
+        "sources": [src[1] for src in sorted(all_sources.items())],
+        "retrieved_doc_ids": [[s["document_id"] for s in src[1]] for src in sorted(all_sources.items())],
         "time": {
             "tb_time": tree_rag.tb_time if tree_rag is not None else -1,
             "tr_time": tree_rag.tr_time if tree_rag is not None else -1,

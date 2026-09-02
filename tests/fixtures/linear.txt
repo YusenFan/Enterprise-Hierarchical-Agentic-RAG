@@ -1,0 +1,13 @@
+description:
+Design a small set of high-contrast onboarding visual assets for the API/SDK quickstart docs. Related: ENG-4210, PM-331.
+
+acceptance_criteria:
+Three code-card variants produced: API key, OAuth device flow, service account.
+
+project: Embeddings & Rerank quickstart
+
+comments:
+2026-03-10
+Looks good, one nit on contrast.
+2026-03-12
+Shipped the SVG exports.

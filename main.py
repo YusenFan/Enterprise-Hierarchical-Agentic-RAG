@@ -30,7 +30,9 @@ from src import (
     TransformersQAModel,
     TransformersRerankModel,
 )
-from src.dataset import split_dataset
+from src.dataset import enterprise_kwargs_from_conf, split_dataset
+from src.metadata import collect_sources
+from src.model.factory import build_model
 from src.prompt import AgentPrompt, get_qa_template
 from src.utils import (
     get_token_length,
@@ -53,7 +55,10 @@ def main():
         dataset_name=conf["dataset"],
         data_dir=conf["data_dir"],
         test_samples=conf["test_samples"],
+        enterprise_kwargs=enterprise_kwargs_from_conf(conf),
     )
+    if getattr(data, "subset_stats", None):
+        tqdm.write(f"EnterpriseRAG-Bench subset: {data.subset_stats}")
 
     if conf.get("tree_build_diagnostics"):
         if isinstance(data.all_passages, str):
@@ -67,7 +72,16 @@ def main():
         if conf["rerank_top_k"] is not None
         else conf["tree_top_k"]
     )
-    evaluator = Evaluator(data=data, top_k_nodes_per_layer=top_k)
+    judge_cache_path = (
+        os.path.join(conf["save_dir"], "results", f'{conf["config"]}_judge.json')
+        if conf["save_dir"] is not None else None
+    )
+    evaluator = Evaluator(
+        data=data,
+        top_k_nodes_per_layer=top_k,
+        judge_workers=conf.get("judge_workers", 8),
+        judge_cache_path=judge_cache_path,
+    )
 
     if not os.path.exists(conf["log_path"]):
         os.makedirs(conf["log_path"])
@@ -79,46 +93,7 @@ def main():
 
     if not results:
         def set_model(model_name, task_type):
-            framework, model_name = model_name.split(sep=":", maxsplit=1)
-            model_class = {
-                "ollama": {
-                    "embed": OllamaEmbeddingModel,
-                    "abs": OllamaAbstractModel,
-                    "qa": OllamaQAModel,
-                },
-                "transformers": {
-                    "embed": TransformersEmbeddingModel,
-                    "abs": TransformersAbstractModel,
-                    "qa": TransformersQAModel,
-                    "rerank": TransformersRerankModel,
-                },
-                "sentence-transformers": {
-                    "embed": SentenceTransformersEmbeddingModel,
-                },
-                "vllm": {
-                    "embed": VLLMEmbeddingModel,
-                    "abs": VLLMAbstractModel,
-                    "qa": VLLMQAModel,
-                    "rerank": VLLMRerankModel,
-                },
-                "api": {
-                    "embed": OpenAIEmbeddingModel,
-                    "abs": OpenAIAbstractModel,
-                    "qa": OpenAIQAModel,
-                },
-            }[framework][task_type]
-            model_kwargs = {
-                "embed": conf["embed_model_kwargs"],
-                "abs": conf["abs_model_kwargs"],
-                "qa": conf["qa_model_kwargs"],
-                "rerank": conf["rerank_model_kwargs"],
-            }[task_type]
-
-            return model_class(
-                model_name,
-                cache_dir=conf.get(f"{task_type}_cache_dir", None),
-                **model_kwargs,
-            )
+            return build_model(model_name, task_type, conf)
 
         model_pool = ("qa",) if conf["no_retrieval"] else tuple(
             model_type.rsplit("_name", maxsplit=1)[0]
@@ -207,6 +182,11 @@ def main():
         all_qa_time = []
         all_answers = {}
         all_contexts = {}
+        all_sources = {}
+
+        def sources_for(top_k_scores, query_id):
+            tree = tree_rag.tree[data.query_to_doc_ids[query_id]] if isinstance(tree_rag.tree, List) else tree_rag.tree
+            return collect_sources(tree, top_k_scores)
 
         def get_max_retrieval_time_verbose_lines(query_id, predicted_hop_label):
             if conf["max_retrieval_time"] != "auto" or not conf["verbose"]:
@@ -265,7 +245,7 @@ def main():
                     tqdm.write(output)
                 logger.write(output)
 
-                return query_id, answer, context, qa_time
+                return query_id, answer, context, qa_time, []
 
             if conf["max_retrieval_time"] == "auto":
                 query_embedding = conf["embed_model"].embed(query)
@@ -354,6 +334,7 @@ def main():
                         for top_k_node_index in top_k_scores.keys()
                     ]
 
+                sources = sources_for(top_k_scores, query_id)
                 subquestions_text = "\n\t".join(state_log["subquestion"][1:])
                 thoughts_text = "\n\t".join(state_log["thought"])
                 output = "\n".join(
@@ -364,6 +345,7 @@ def main():
                         f"sub-questions: {subquestions_text}",
                         f"thoughts: {thoughts_text}",
                         f"answer: {answer}",
+                        f"sources: {', '.join(s['document_id'] for s in sources) if sources else 'NA'}",
                         f"gold answer: {data.gold_answers[query_id] if data.gold_answers is not None else 'NA'}",
                         "\n",
                     ]
@@ -410,6 +392,7 @@ def main():
                     ]
                 while len(context) < top_k:
                     context.append("")
+                sources = sources_for(top_k_scores, query_id)
 
                 output = "\n".join(
                     [
@@ -418,6 +401,7 @@ def main():
                         *max_retrieval_time_verbose_lines,
                         f"thoughts: {thought}",
                         f"answer: {answer}",
+                        f"sources: {', '.join(s['document_id'] for s in sources) if sources else 'NA'}",
                         f"gold answer: {data.gold_answers[query_id] if data.gold_answers is not None else 'NA'}",
                         "\n",
                     ]
@@ -427,7 +411,7 @@ def main():
                 tqdm.write(output)
             logger.write(output)
 
-            return query_id, answer, context, qa_time
+            return query_id, answer, context, qa_time, sources
 
         tqdm.write("Answering questions...")
         if conf["multithreading_qa_batch_size"] > 1:
@@ -455,16 +439,18 @@ def main():
                         )
                     ]
                     for future in as_completed(future_qa_results):
-                        query_id, answer, context, qa_time = future.result()
+                        query_id, answer, context, qa_time, sources = future.result()
                         all_answers[query_id] = answer
                         all_contexts[query_id] = context
+                        all_sources[query_id] = sources
                         all_qa_time.append(qa_time)
         else:
             bar = tqdm(data.all_queries, desc="qa")
             for query_id, query in enumerate(bar):
-                _, answer, context, qa_time = qa(query, query_id)
+                _, answer, context, qa_time, sources = qa(query, query_id)
                 all_answers[query_id] = answer
                 all_contexts[query_id] = context
+                all_sources[query_id] = sources
                 all_qa_time.append(qa_time)
 
         bar.close()
@@ -472,6 +458,8 @@ def main():
         results = {
             "answers": [ans[1] for ans in sorted(all_answers.items())],
             "retrieved_docs": [cont[1] for cont in sorted(all_contexts.items())],
+            "sources": [src[1] for src in sorted(all_sources.items())],
+            "retrieved_doc_ids": [[s["document_id"] for s in src[1]] for src in sorted(all_sources.items())],
             "time": {
                 "tb_time": tree_rag.tb_time if tree_rag is not None else -1,
                 "tr_time": tree_rag.tr_time if tree_rag is not None else -1,
@@ -500,10 +488,14 @@ def main():
         logger.writelines(retrieval_stats.splitlines())
 
     tqdm.write("Evaluating results...")
+    metrics = conf["evaluation_metrics"]
+    if (metrics == "all" or "llmjudge" in metrics) and conf.get("judge_name"):
+        evaluator.judge_model = conf.get("judge_model") or build_model(conf["judge_name"], "judge", conf)
     scores = evaluator.evaluate(
         answers=results.get("answers", None),
         retrieved_docs=results.get("retrieved_docs", None),
-        metrics=conf["evaluation_metrics"],
+        retrieved_doc_ids=results.get("retrieved_doc_ids", None),
+        metrics=metrics,
     )
 
     if "time" in results:

@@ -104,7 +104,36 @@ class TreeBuilder:
 
         return leaf_nodes, max(leaf_nodes.keys())
 
-    def build_index(self, docs: List[str] | List[List[str]], use_multithreading: bool = True) -> Tuple[Tree, float]:
+    def _attach_leaf_metadata(
+        self,
+        leaf_nodes: Dict[int, Node],
+        document_ids: Optional[List[str]] = None,
+        chunk_metadata: Optional[List[List[Dict]]] = None,
+    ) -> None:
+        """
+        Give every leaf its `document_id` (from the corpus position `document_index`) and its
+        chunk-level `local_metadata`. Runs once after leaf creation, so every leaf-creation
+        branch of build_index is covered.
+        """
+        if document_ids is None and chunk_metadata is None:
+            return
+        for node in leaf_nodes.values():
+            doc_idx, chunk_idx = node.document_index, node.chunk_index
+            if doc_idx is None or doc_idx < 0:
+                continue
+            if document_ids is not None and doc_idx < len(document_ids):
+                node.document_id = document_ids[doc_idx]
+            if chunk_metadata is not None and doc_idx < len(chunk_metadata) \
+                    and 0 <= chunk_idx < len(chunk_metadata[doc_idx]):
+                node.local_metadata = chunk_metadata[doc_idx][chunk_idx]
+
+    def build_index(
+        self,
+        docs: List[str] | List[List[str]],
+        use_multithreading: bool = True,
+        document_ids: Optional[List[str]] = None,
+        chunk_metadata: Optional[List[List[Dict]]] = None,
+    ) -> Tuple[Tree, float]:
         logging.info("Creating Leaf Nodes")
         self._warm_up_embed_model()
         tqdm.write(f"Creating node embeddings...") 
@@ -162,6 +191,7 @@ class TreeBuilder:
                         _, node = self.create_node(index, -1, index, text)
                         leaf_nodes[index] = node
 
+        self._attach_leaf_metadata(leaf_nodes, document_ids, chunk_metadata)
         layer_to_node_indices = {0: sorted(list(node.index for node in leaf_nodes.values()))}
 
         logging.info(f"Created {len(leaf_nodes)} Leaf Embeddings")

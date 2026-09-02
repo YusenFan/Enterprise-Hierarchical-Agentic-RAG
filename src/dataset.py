@@ -8,6 +8,8 @@ from tqdm import tqdm
 
 import numpy as np
 
+from .enterprise_rag import load_enterprise_rag
+from .metadata import Document, ProjectVocabulary, get_parser
 from .pdf import load_local_pdf_data
 from .utils import split_text, split_sentences, chunk_sentences_semantic
 
@@ -22,6 +24,7 @@ dataset_pool = (
     "infinitybench_longbook",
     "qmsum",
     "wcep",
+    "enterprise_rag",
 )
 
 
@@ -32,12 +35,26 @@ class DataManager:
                  data_dir: str = "./data",
                  test_samples: int = -1,
                  local_pdf: str | None = None,
+                 enterprise_kwargs: Dict[str, Any] | None = None,
                  **pdf_kwargs) -> None:
         
         self.dataset_name: str = dataset_name.lower()
         self.local_pdf = local_pdf
         if not self.local_pdf and self.dataset_name not in dataset_pool:
             raise NotImplementedError(f"Dataset {self.dataset_name} is currently not supported.")
+
+        # EnterpriseRAG-Bench: metadata-bearing documents (see src/metadata).
+        self.is_enterprise: bool = self.dataset_name == "enterprise_rag"
+        self.enterprise_kwargs: Dict[str, Any] = dict(enterprise_kwargs or {})
+        self.documents: List[Document] | None = None          # one Document per corpus document
+        self.document_registry: Dict[str, Document] | None = None
+        self.chunk_local_metadata: List[List[Dict]] | None = None
+        self.gold_doc_ids: List[List[str]] | None = None       # expected_doc_ids per question
+        self.answer_facts: List[List[str]] | None = None
+        self.question_types: List[str] | None = None
+        self.question_ids: List[str] | None = None
+        self.subset_stats: Dict[str, Any] = {}
+        self.project_vocab: ProjectVocabulary | None = None
 
         self.data: List[Dict] | None = None
         self.data_path: str | None = None 
@@ -48,7 +65,9 @@ class DataManager:
         if test_samples > 0:
             if self.data is not None:
                 self.data = self.data[:test_samples]
-            if self.corpus is not None:
+            # The enterprise corpus size is controlled by the subset, not by test_samples:
+            # every gold document must stay in the index for the questions that are kept.
+            if self.corpus is not None and not self.is_enterprise:
                 self.corpus = self.corpus[:test_samples]
         # ------------------- FOR QA TESTING ONLY -------------------
 
@@ -96,6 +115,17 @@ class DataManager:
                     lines = file.readlines()
                     for line in lines:
                         self.data.append(json.loads(line))
+            elif self.is_enterprise:
+                kw = self.enterprise_kwargs
+                self.data_path = kw.get("data_dir") or os.path.join(data_dir, "enterpriseRAG-Bench")
+                self.corpus, self.data, self.subset_stats = load_enterprise_rag(
+                    self.data_path,
+                    subset_size=kw.get("subset_size", 5000),
+                    seed=kw.get("seed", 42),
+                    cache_dir=kw.get("cache_dir"),
+                    force=bool(kw.get("force_rebuild", False)),
+                )
+                self.project_vocab = ProjectVocabulary.load(kw.get("project_vocab"))
             else:
                 raise NotImplementedError
         except FileNotFoundError:
@@ -107,7 +137,16 @@ class DataManager:
         """
         Get supporting documents for retrieval evaluation. Depending on the dataset format, 
         gold documents can be either a list of strings or a list of list of strings.
+        For EnterpriseRAG-Bench the labels are document ids (`gold_doc_ids`), not texts.
         """
+        if self.is_enterprise:
+            self.gold_doc_ids = [list(sample.get("expected_doc_ids", [])) for sample in self.data]
+            self.answer_facts = [list(sample.get("answer_facts", [])) for sample in self.data]
+            self.question_types = [sample.get("question_type") for sample in self.data]
+            self.question_ids = [sample.get("question_id") for sample in self.data]
+            self.gold_docs = None
+            self.gold_nodes_id = None
+            return
         for sample in self.data:
             gold_node_id = []
             if 'supporting_facts' in sample:  # hotpotqa, 2wikimultihopqa
@@ -173,6 +212,8 @@ class DataManager:
                 gold_ans = list(gold_ans)
             elif 'golden_answers' in sample:
                 gold_ans = sample['golden_answers']
+            elif 'gold_answer' in sample:  # enterprise_rag
+                gold_ans = sample['gold_answer']
             elif self.dataset_name in ("qmsum"):
                 gold_ans = sample['general_query_list'][0]['answer']
             elif self.dataset_name in ("wcep"):
@@ -194,7 +235,66 @@ class DataManager:
 
             self.gold_answers.append(gold_ans)
 
+    def _preprocess_enterprise(self) -> None:
+        """
+        Parse every corpus row with its source-type parser: the Document registry becomes the
+        authoritative metadata source, `all_text_ids` holds the document ids (aligned with
+        `all_passages`, so `document_index` in the tree still indexes both lists).
+        """
+        self.documents = []
+        self.document_registry = {}
+        if self.enterprise_kwargs.get("vocab_from_hubspot", True):
+            # HubSpot titles are clean account names: let every source match them as entities.
+            accounts = {row["title"].strip(): [row["title"].strip()] for row in self.corpus
+                        if row.get("source_type") == "hubspot" and row.get("title")
+                        and 3 <= len(row["title"].strip()) <= 60}
+            vocab = self.project_vocab or ProjectVocabulary()
+            self.project_vocab = ProjectVocabulary(vocab.projects, {**accounts, **vocab.entities})
+        bar = tqdm(self.corpus, desc="parsing metadata")
+        for row in bar:
+            doc_id = row["doc_id"]
+            if doc_id in self.document_registry:
+                continue
+            parser = get_parser(row["source_type"])
+            text = parser.normalize_content(row.get("content") or "")
+            doc = parser.parse(doc_id, row["source_type"], row.get("title") or "", text, vocab=self.project_vocab)
+            self.documents.append(doc)
+            self.document_registry[doc_id] = doc
+            self.all_text_ids.append(doc_id)
+            self.all_passages.append(text)  # List[str]; chunked later by split_dataset()
+        bar.close()
+
+    def finalize_chunks(self, title_prefix: bool = True) -> None:
+        """
+        Called once the passages are chunked (List[List[str]]): computes chunk-level
+        `local_metadata` and optionally prefixes every chunk with the document title so that
+        channel / account / ticket titles reach every chunk (tree text and BM25 text stay identical).
+        """
+        if not self.documents:
+            return
+        if isinstance(self.all_passages, str):
+            self.all_passages = [[self.all_passages]]
+        elif self.all_passages and isinstance(self.all_passages[0], str):
+            self.all_passages = [[passage] for passage in self.all_passages]
+        self.chunk_local_metadata = []
+        for doc, chunks in zip(self.documents, self.all_passages):
+            parser = get_parser(doc.source_type)
+            state: Dict[str, Any] = {}
+            self.chunk_local_metadata.append([parser.local_metadata(chunk, doc, state) for chunk in chunks])
+            if title_prefix and doc.title:
+                chunks[:] = [f"{doc.title}\n{chunk}" for chunk in chunks]
+            doc.num_chunks = len(chunks)
+
     def preprocess(self):
+        if self.is_enterprise:
+            self._preprocess_enterprise()
+            bar = tqdm(self.data, desc="preprocessing query")
+            for i, sample_text in enumerate(bar):
+                self.all_queries.append(sample_text['question'])
+                self.query_to_doc_ids.append(i)
+            bar.close()
+            return
+
         if self.corpus is not None: # musique, hotpotqa, 2wikimultihopqa, nq, popqa, narrativeqa, multihoprag
             bar = tqdm(self.corpus, desc="preprocessing text") 
         else: # qmsum, wcep, infinitybench_longbook
@@ -425,6 +525,17 @@ class DataManager:
         return len(self.data) if self.data is not None else 0
 
 
+def enterprise_kwargs_from_conf(conf: Dict) -> Dict[str, Any]:
+    """DataManager(enterprise_kwargs=...) from the enterprise_* config keys."""
+    return {
+        "data_dir": conf.get("enterprise_data_dir"),
+        "subset_size": conf.get("enterprise_subset_size", 5000),
+        "seed": conf.get("enterprise_subset_seed", 42),
+        "cache_dir": conf.get("enterprise_subset_cache_dir"),
+        "project_vocab": conf.get("enterprise_project_vocab"),
+    }
+
+
 def split_dataset(data: DataManager, conf: Dict) -> None:
     """
     Decide whether `data.all_passages` must be split for `conf` and split it in place.
@@ -481,6 +592,8 @@ def split_dataset(data: DataManager, conf: Dict) -> None:
     )
     if recorder is not None:
         report_chunking_diagnostics(recorder, conf)
+    if getattr(data, "documents", None):
+        data.finalize_chunks(title_prefix=bool(conf.get("enterprise_chunk_title_prefix", True)))
 
 
 def report_chunking_diagnostics(recorder: Dict, conf: Dict) -> None:

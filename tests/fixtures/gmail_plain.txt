@@ -1,0 +1,24 @@
+From: Irene Choi <irene_choi@redwoodinference.com>
+To: Kevin Osei <kevin_osei@redwoodinference.com>, Naomi Feldman <naomi_feldman@redwoodinference.com>
+Cc: Allison Grant <allison_grant@redwoodinference.com>
+Date: Tue, Jun 10, 2025 at 9:12 AM
+Subject: Private Upgrades: audit log requirements
+Attachment: redwood-private-upgrades-audit-events-v0.3.xlsx
+
+Team,
+
+Looping you in on auditability requirements coming in from Cascade Financial (regulated VPC private).
+Retention expectation: 13 months minimum for audit events.
+
+Irene
+
+
+
+From: Kevin Osei <kevin_osei@redwoodinference.com>
+To: Irene Choi <irene_choi@redwoodinference.com>
+Date: 2025-06-11T14:30:00Z
+Subject: Re: Private Upgrades: audit log requirements
+
+Thanks Irene. ENG-4129 tracks the event list.
+
+Kevin
