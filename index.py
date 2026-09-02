@@ -1,7 +1,6 @@
 import os
 import argparse
 
-from typing import List
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
@@ -10,6 +9,7 @@ from src import (
     RAG,
     DataManager,
     OpenAIAbstractModel,
+    OpenAIEmbeddingModel,
     OllamaAbstractModel,
     OllamaEmbeddingModel,
     VLLMEmbeddingModel,
@@ -18,11 +18,13 @@ from src import (
     TransformersAbstractModel,
     TransformersEmbeddingModel,
 )
+from src.dataset import split_dataset
 from src.pdf import prepare_local_pdf_dataset
 from src.utils import (
     get_token_length,
     is_bucketed_tree,
     get_tree_save_name,
+    get_sparse_save_name,
     remove_tree_target,
     print_tree_check,
 )
@@ -38,7 +40,7 @@ def main():
         if conf["save_dir"] is not None:
             save_tree_name = get_tree_save_name(conf)
             save_tree_path = os.path.join(conf["save_dir"], save_tree_name)
-            sparse_index_path = os.path.join(conf["save_dir"], f"bm25_{conf['dataset']}")
+            sparse_index_path = os.path.join(conf["save_dir"], get_sparse_save_name(conf))
             if (os.path.exists(save_tree_path) or os.path.exists(sparse_index_path)) \
                 and not conf["force_index_from_scratch"]:
                 raise ValueError(
@@ -65,27 +67,6 @@ def main():
             passages = data.get_documents()
         tqdm.write(f"Dataset token stats: {get_token_length(passages)}")
 
-    if isinstance(data.all_passages, str):
-        conf["passage_as_tree"] = True
-        conf["force_split"] = True
-        data.split_text(
-            tokenizer=conf["tokenizer"],
-            max_tokens=conf["max_tokens_per_chunk"],
-        )
-    elif isinstance(data.all_passages, List) and isinstance(data.all_passages[0], str):
-        if conf["passage_as_tree"] or conf["force_split"]:
-            conf["force_split"] = True
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
-    elif isinstance(data.all_passages[0], List):
-        if conf["force_split"]:
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
-
     def set_model(model_name, task_type):
         framework, model_name = model_name.split(sep=":", maxsplit=1)
         model_class = {
@@ -105,6 +86,7 @@ def main():
                 "abs": VLLMAbstractModel,
             },
             "api": {
+                "embed": OpenAIEmbeddingModel,
                 "abs": OpenAIAbstractModel,
             },
         }[framework][task_type]
@@ -125,6 +107,9 @@ def main():
     for model_type in models_to_prepare:
         task_type = model_type.rsplit("_name", maxsplit=1)[0]
         conf[f"{task_type}_model"] = set_model(conf[model_type], task_type)
+
+    # Split after the models are ready: semantic chunking embeds every sentence.
+    split_dataset(data, conf)
 
     tree_rag = RAG(conf)
 

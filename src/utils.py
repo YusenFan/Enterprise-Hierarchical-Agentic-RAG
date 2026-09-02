@@ -7,7 +7,7 @@ import string
 import numpy as np
 import tiktoken
 
-from typing import Dict, Tuple, List, Set
+from typing import Dict, Tuple, List, Optional, Sequence, Set
 from pathlib import Path
 from scipy import spatial
 from tqdm import tqdm
@@ -58,8 +58,17 @@ def reverse_mapping(layer_to_node_indices: Dict[int, List[int]]) -> Dict[int, in
     return node_to_layer
 
 
+def _resolve_tokenizer(tokenizer) -> tiktoken.Encoding:
+    """Accepts a tiktoken encoding name or an Encoding instance and returns the Encoding."""
+    if tokenizer is None:
+        raise ValueError("There is no tokenizer. ")
+    if isinstance(tokenizer, str):
+        return tiktoken.get_encoding(tokenizer)
+    return tokenizer
+
+
 def split_text(
-    text: str, tokenizer: str, max_tokens: int, overlap: int = 0
+    text: str, tokenizer: str | tiktoken.Encoding, max_tokens: int, overlap: int = 0
 ) -> List[str]:
     """
     Splits the input text into smaller chunks based on the tokenizer and maximum allowed tokens.
@@ -73,9 +82,7 @@ def split_text(
     Returns:
         List[str]: A list of text chunks.
     """
-    if tokenizer is None:
-        raise ValueError("There is no tokenizer. ")
-    tokenizer = tiktoken.get_encoding(tokenizer)
+    tokenizer = _resolve_tokenizer(tokenizer)
 
     # Split the text into sentences using multiple delimiters
     delimiters = [".", "!", "?", "\n"]
@@ -142,6 +149,357 @@ def split_text(
         chunks.append(" ".join(current_chunk))
     
     return chunks
+
+
+DEFAULT_SENTENCE_DELIMITERS = (".", "!", "?", "\n")
+
+
+def split_sentences(
+    text: str, sentence_delimiters: Sequence[str] = DEFAULT_SENTENCE_DELIMITERS
+) -> List[str]:
+    """
+    Splits text into sentences, keeping each delimiter attached to its sentence.
+
+    Punctuation delimiters only end a sentence when they are followed by whitespace
+    (or the end of the text), so tokens like "3.14" or "www.example.com" are not cut apart.
+    Line breaks always end a sentence.
+
+    Args:
+        text (str): The text to be split.
+        sentence_delimiters (Sequence[str]): Characters that end a sentence.
+
+    Returns:
+        List[str]: Non-empty, stripped sentences in document order.
+    """
+    if not text or not text.strip():
+        return []
+
+    punctuation = [d for d in sentence_delimiters if d not in ("\n", "\r")]
+    patterns = []
+    if punctuation:
+        char_class = "".join(re.escape(d) for d in punctuation)
+        patterns.append(rf"(?<=[{char_class}])\s+")
+    if any(d in ("\n", "\r") for d in sentence_delimiters):
+        patterns.append(r"[\r\n]+")
+    if not patterns:
+        return [text.strip()]
+
+    pieces = re.split("|".join(patterns), text)
+    return [piece.strip() for piece in pieces if piece and piece.strip()]
+
+
+def _consecutive_distances(embeddings: np.ndarray, distance_metric: str = "cosine") -> np.ndarray:
+    """Distances between each pair of consecutive rows of `embeddings` (vectorised)."""
+    if len(embeddings) < 2:
+        return np.zeros(0, dtype=float)
+    a, b = embeddings[:-1], embeddings[1:]
+    if distance_metric == "cosine":
+        norms = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cosine = np.sum(a * b, axis=1) / norms
+        cosine = np.where(norms > 0, cosine, 0.0)
+        return 1.0 - np.clip(cosine, -1.0, 1.0)
+    if distance_metric == "L1":
+        return np.sum(np.abs(a - b), axis=1)
+    if distance_metric == "L2":
+        return np.linalg.norm(a - b, axis=1)
+    if distance_metric == "Linf":
+        return np.max(np.abs(a - b), axis=1)
+    raise ValueError(
+        f"Unsupported distance metric '{distance_metric}'. "
+        "Supported metrics are: ['cosine', 'L1', 'L2', 'Linf']"
+    )
+
+
+def _split_long_sentence(sentence: str, tokenizer: tiktoken.Encoding, max_tokens: int) -> List[str]:
+    """
+    Splits a sentence longer than `max_tokens` with the static splitter ("[,;:]" fallback);
+    any piece that still exceeds `max_tokens` (no delimiters at all, e.g. an infobox or a
+    table row) is hard-cut into token windows so the bound always holds.
+    """
+    pieces = []
+    for piece in split_text(sentence, tokenizer, max_tokens):
+        token_ids = tokenizer.encode(" " + piece)
+        if len(token_ids) <= max_tokens:
+            pieces.append(piece)
+            continue
+        for start in range(0, len(token_ids), max_tokens):
+            window = tokenizer.decode(token_ids[start: start + max_tokens]).strip()
+            if window:
+                pieces.append(window)
+    return pieces
+
+
+def _new_chunk(text: str, tokens: int, embedding: np.ndarray, reason: str = None) -> Dict:
+    return {
+        "texts": [text],
+        "tokens": int(tokens),
+        "emb_sum": np.asarray(embedding, dtype=float).copy(),
+        "n_sents": 1,
+        "distances": [],
+        "reason": reason,
+        "triggering_distance": None,
+        "merged_from": [],
+    }
+
+
+def _chunk_embedding(chunk: Dict) -> np.ndarray:
+    """Chunk embedding = mean of its sentence embeddings."""
+    return chunk["emb_sum"] / max(chunk["n_sents"], 1)
+
+
+def _merge_short_chunks(
+    chunks: List[Dict],
+    short_chunk_tokens: int,
+    merge_threshold: Optional[float],
+    max_tokens: int,
+    distance_metric: str = "cosine",
+) -> List[Dict]:
+    """
+    Post-pass over provisional semantic chunks. A chunk shorter than `short_chunk_tokens`
+    is compared with its left and right neighbours; it is merged into the more similar one
+    only if it is NOT semantically independent (distance <= merge_threshold) and the merged
+    chunk still fits in `max_tokens`. Independent short chunks are kept as they are.
+    """
+    if short_chunk_tokens <= 0 or merge_threshold is None or len(chunks) < 2:
+        return chunks
+
+    chunks = list(chunks)
+    merged = True
+    while merged and len(chunks) > 1:
+        merged = False
+        i = 0
+        while i < len(chunks) and len(chunks) > 1:
+            chunk = chunks[i]
+            if chunk["tokens"] >= short_chunk_tokens:
+                i += 1
+                continue
+
+            candidates = []
+            if i > 0:
+                candidates.append(("left", i - 1))
+            if i < len(chunks) - 1:
+                candidates.append(("right", i + 1))
+            neighbour_embeddings = [_chunk_embedding(chunks[j]) for _, j in candidates]
+            neighbour_distances = distances_from_embeddings(
+                _chunk_embedding(chunk), neighbour_embeddings, distance_metric
+            )
+            k = int(np.argmin(neighbour_distances))
+            side, j = candidates[k]
+            distance = float(neighbour_distances[k])
+            neighbour = chunks[j]
+
+            if distance <= merge_threshold and chunk["tokens"] + neighbour["tokens"] <= max_tokens:
+                left, right = (neighbour, chunk) if side == "left" else (chunk, neighbour)
+                merged_chunk = {
+                    "texts": left["texts"] + right["texts"],
+                    "tokens": left["tokens"] + right["tokens"],
+                    "emb_sum": left["emb_sum"] + right["emb_sum"],
+                    "n_sents": left["n_sents"] + right["n_sents"],
+                    "distances": left["distances"] + right["distances"],
+                    "reason": right["reason"],
+                    "triggering_distance": right["triggering_distance"],
+                    "merged_from": left["merged_from"] + right["merged_from"] + [{
+                        "text": " ".join(chunk["texts"]),
+                        "tokens": chunk["tokens"],
+                        "merged_into": side,
+                        "distance": distance,
+                    }],
+                }
+                first = min(i, j)
+                chunks[first] = merged_chunk
+                del chunks[max(i, j)]
+                merged = True
+                i = first
+            else:
+                i += 1
+    return chunks
+
+
+def chunk_sentences_semantic(
+    sentences: List[str],
+    sentence_embeddings,
+    tokenizer: str | tiktoken.Encoding,
+    max_tokens: int,
+    semantic_threshold: float,
+    semantic_threshold_type: str = "percentile",
+    distance_metric: str = "cosine",
+    short_chunk_tokens: int = 0,
+    merge_threshold: Optional[float] = None,
+    distance_recorder: Optional[Dict] = None,
+) -> List[str]:
+    """
+    Groups consecutive sentences into chunks using the semantic distance between
+    neighbouring sentences and a maximum token count per chunk.
+
+    Args:
+        sentences (List[str]): Sentences in document order (see `split_sentences`).
+        sentence_embeddings: One embedding per sentence, shape (len(sentences), dim).
+        tokenizer: tiktoken encoding name or Encoding used to count tokens.
+        max_tokens (int): Maximum token count of one chunk.
+        semantic_threshold (float): Split threshold, see `semantic_threshold_type`.
+        semantic_threshold_type (str): "percentile" splits where the distance exceeds the
+            `semantic_threshold`-th percentile of this document's consecutive-sentence
+            distances; "absolute" splits where the distance > `semantic_threshold`.
+        distance_metric (str): ("cosine", "L1", "L2", "Linf").
+        short_chunk_tokens (int): Chunks shorter than this are candidates for merging into
+            their more similar neighbour (see `_merge_short_chunks`). 0 disables the post-pass.
+        merge_threshold (float | None): Distance below which a short chunk counts as not
+            semantically independent. None reuses the effective split threshold.
+        distance_recorder (Dict | None): If given, filled with per-chunk diagnostics.
+
+    Returns:
+        List[str]: Text chunks in document order.
+    """
+    if not sentences:
+        return []
+    tokenizer = _resolve_tokenizer(tokenizer)
+
+    embeddings = np.asarray(sentence_embeddings, dtype=float)
+    if embeddings.ndim == 1:
+        embeddings = embeddings.reshape(1, -1)
+    if len(embeddings) != len(sentences):
+        raise ValueError(
+            f"Got {len(embeddings)} sentence embeddings for {len(sentences)} sentences."
+        )
+
+    n_tokens = [len(tokenizer.encode(" " + sentence)) for sentence in sentences]
+    distances = _consecutive_distances(embeddings, distance_metric)
+
+    if semantic_threshold_type == "percentile":
+        if not 0 <= semantic_threshold <= 100:
+            raise ValueError("A percentile semantic_threshold must be within [0, 100].")
+        threshold = float(np.percentile(distances, semantic_threshold)) if len(distances) else None
+    elif semantic_threshold_type == "absolute":
+        threshold = float(semantic_threshold)
+    else:
+        raise ValueError(
+            f"Unsupported semantic_threshold_type '{semantic_threshold_type}'. "
+            "Expected 'percentile' or 'absolute'."
+        )
+    if merge_threshold is None:
+        merge_threshold = threshold
+
+    chunks: List[Dict] = []
+    current: Optional[Dict] = None
+
+    def close(reason: str, triggering_distance: Optional[float] = None) -> None:
+        nonlocal current
+        if current is not None:
+            current["reason"] = reason
+            current["triggering_distance"] = triggering_distance
+            chunks.append(current)
+            current = None
+
+    for i, sentence in enumerate(sentences):
+        tokens = n_tokens[i]
+
+        # A single sentence longer than max_tokens: close the running chunk and
+        # sub-split the sentence with the static splitter ("[,;:]" fallback).
+        if tokens > max_tokens:
+            close("followed_by_long_sentence")
+            for piece in _split_long_sentence(sentence, tokenizer, max_tokens):
+                piece_tokens = len(tokenizer.encode(" " + piece))
+                chunks.append(_new_chunk(piece, piece_tokens, embeddings[i], reason="single_long_sentence"))
+            continue
+
+        if current is None:
+            current = _new_chunk(sentence, tokens, embeddings[i])
+            continue
+
+        distance = float(distances[i - 1])
+        split_semantic = threshold is not None and distance > threshold
+        split_length = current["tokens"] + tokens > max_tokens
+        if split_semantic or split_length:
+            close("semantic" if split_semantic else "length", distance if split_semantic else None)
+            current = _new_chunk(sentence, tokens, embeddings[i])
+        else:
+            current["texts"].append(sentence)
+            current["tokens"] += tokens
+            current["emb_sum"] += embeddings[i]
+            current["n_sents"] += 1
+            current["distances"].append(distance)
+    close("end_of_text")
+
+    chunks = _merge_short_chunks(chunks, short_chunk_tokens, merge_threshold, max_tokens, distance_metric)
+
+    if distance_recorder is not None:
+        distance_recorder["num_sentences"] = len(sentences)
+        distance_recorder["effective_threshold"] = threshold
+        distance_recorder["merge_threshold"] = merge_threshold
+        distance_recorder["chunks"] = [
+            {
+                "chunk_text": " ".join(chunk["texts"]),
+                "tokens": int(chunk["tokens"]),
+                "distances_between_sentences": [float(d) for d in chunk["distances"]],
+                "average_distance": float(np.mean(chunk["distances"])) if chunk["distances"] else 0.0,
+                "split_info": {
+                    "reason": chunk["reason"],
+                    "triggering_distance": chunk["triggering_distance"],
+                },
+                "merged_from": chunk["merged_from"],
+            }
+            for chunk in chunks
+        ]
+
+    return [" ".join(chunk["texts"]) for chunk in chunks if chunk["texts"]]
+
+
+def split_text_semantic(
+    text: str,
+    tokenizer: str | tiktoken.Encoding,
+    max_tokens: int,
+    embedding_function,
+    semantic_threshold: float,
+    semantic_threshold_type: str = "percentile",
+    distance_metric: str = "cosine",
+    sentence_delimiters: Sequence[str] = DEFAULT_SENTENCE_DELIMITERS,
+    short_chunk_tokens: int = 0,
+    merge_threshold: Optional[float] = None,
+    distance_recorder: Optional[Dict] = None,
+) -> List[str]:
+    """
+    Splits text into chunks by the semantic distance between consecutive sentences,
+    capped by `max_tokens` per chunk. Falls back to the static `split_text` if the
+    embedding call fails.
+
+    Args:
+        embedding_function: Callable mapping List[str] -> embeddings of shape (n, dim).
+        Other arguments: see `chunk_sentences_semantic` and `split_sentences`.
+    """
+    if not text or not text.strip():
+        return []
+
+    sentences = split_sentences(text, sentence_delimiters)
+    if not sentences:
+        return []
+
+    try:
+        logging.info(f"Embedding {len(sentences)} sentences for semantic chunking...")
+        sentence_embeddings = np.asarray(embedding_function(sentences), dtype=float)
+        if sentence_embeddings.ndim == 1 and len(sentences) == 1:
+            sentence_embeddings = sentence_embeddings.reshape(1, -1)
+        if len(sentence_embeddings) != len(sentences):
+            raise ValueError(
+                f"Got {len(sentence_embeddings)} embeddings for {len(sentences)} sentences."
+            )
+    except Exception as e:
+        logging.error(f"Sentence embedding failed during semantic chunking: {e}")
+        logging.warning("Falling back to static splitting for this text.")
+        return split_text(text, tokenizer, max_tokens)
+
+    return chunk_sentences_semantic(
+        sentences,
+        sentence_embeddings,
+        tokenizer,
+        max_tokens,
+        semantic_threshold,
+        semantic_threshold_type=semantic_threshold_type,
+        distance_metric=distance_metric,
+        short_chunk_tokens=short_chunk_tokens,
+        merge_threshold=merge_threshold,
+        distance_recorder=distance_recorder,
+    )
 
 
 def distances_from_embeddings(
@@ -295,6 +653,8 @@ def get_tree_save_name(conf: Dict) -> str:
         f'{conf["dataset"]}_{conf["embed_name"].replace("/", "_")}'
         f'_{str(conf["abs_name"]).replace("/", "_")}_{conf["abstract_type"]}'
     )
+    if conf.get("chunking") == "semantic":
+        prefix = f"{prefix}_semantic"
     tree_builder = conf.get("tree_builder", "exact")
 
     if is_bucketed_tree(conf):
@@ -302,6 +662,14 @@ def get_tree_save_name(conf: Dict) -> str:
     if tree_builder != "exact":
         return sanitize_save_name(f"{prefix}_{tree_builder}_tree.pkl")
     return sanitize_save_name(f"{prefix}_tree.pkl")
+
+
+def get_sparse_save_name(conf: Dict) -> str:
+    """Directory name of the BM25 index. Tagged like the tree so both always match."""
+    name = f"bm25_{conf['dataset']}"
+    if conf.get("chunking") == "semantic":
+        name = f"{name}_semantic"
+    return name
 
 
 def remove_tree_target(path: str) -> None:

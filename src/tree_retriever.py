@@ -10,7 +10,7 @@ import bm25s
 import Stemmer
 import numpy as np
 from .utils import (Node, Tree, distances_from_embeddings, get_embeddings, get_text_list,
-                    reverse_mapping, rrf)
+                    get_sparse_save_name, reverse_mapping, rrf)
 
 logging.basicConfig(format="%(asctime)s - %(message)s", 
                     level=logging.INFO,
@@ -55,7 +55,7 @@ class TreeRetriever:
         if self.hybrid_search_model is not None and self.conf["save_dir"] is not None:
             hybrid_save_dir = os.path.join(
                 self.conf["save_dir"],
-                f"bm25_{self.conf['dataset']}",
+                get_sparse_save_name(self.conf),
             )
             if os.path.exists(hybrid_save_dir) and not self.conf["force_sparse_index_from_scratch"]:
                 self.hybrid_search_model = self.hybrid_search_model.load(hybrid_save_dir, load_corpus=True)
@@ -228,7 +228,7 @@ class TreeRetriever:
         if self.conf["save_dir"] is not None:
             hybrid_save_dir = os.path.join(
                 self.conf["save_dir"],
-                f"bm25_{self.conf['dataset']}",
+                get_sparse_save_name(self.conf),
             )
             if self.conf["force_sparse_index_from_scratch"] and os.path.exists(hybrid_save_dir):
                 shutil.rmtree(hybrid_save_dir)

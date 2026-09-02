@@ -1,5 +1,6 @@
 import os
 import logging
+import threading
 
 from abc import ABC, abstractmethod
 from typing import List
@@ -24,28 +25,81 @@ logging.basicConfig(format="%(asctime)s - %(message)s",
 
 class BaseEmbeddingModel(ABC):
     model_name: str
+    # Lazy model loading can be triggered from several threads at once
+    # (leaf nodes are embedded in a ThreadPoolExecutor); serialise it.
+    _load_lock = threading.Lock()
 
     @abstractmethod
     def embed(self, text) -> np.ndarray:
         pass
+
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        """
+        Embeds a list of texts and returns an array of shape (len(texts), dim).
+        Backends that support batched inputs override this; the default embeds one text at a time.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, 0), dtype=float)
+        return np.asarray(
+            [np.asarray(self.embed(text), dtype=float).reshape(-1) for text in texts]
+        )
 
     def __repr__(self):
         return self.model_name
 
 
 class OpenAIEmbeddingModel(BaseEmbeddingModel):
-    def __init__(self, model_name="text-embedding-ada-002", **kwargs):
-        self.client = OpenAI()
+    def __init__(self, model_name="text-embedding-3-small", cache_dir=None, **kwargs):
+        """
+        Embeddings from an OpenAI-compatible endpoint. Reads OPENAI_API_KEY and, optionally,
+        OPENAI_BASE_URL from the environment (conf/__init__.py loads them from ".env").
+        Leave OPENAI_BASE_URL empty for the official endpoint (https://api.openai.com/v1).
+
+        Args:
+            model_name (str): text-embedding-3-small, text-embedding-3-large,
+                              text-embedding-ada-002 (official ids carry no "openai/" prefix)
+            dimensions (int, optional): output size for text-embedding-3-* models.
+        """
         self.model_name = model_name
+        self.cache_dir = cache_dir
+        self.model_kwargs = kwargs
+        self.dimensions = self.model_kwargs.pop("dimensions", None)
+
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError(
+                'OPENAI_API_KEY is not set. Put OPENAI_API_KEY (and optionally OPENAI_BASE_URL) '
+                'in ".env" at the repo root (see ".env.example") or export them in your shell.'
+            )
+        # An empty OPENAI_BASE_URL must mean the official endpoint; the SDK would otherwise use "".
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+
+    def _request_kwargs(self):
+        request_kwargs = {"model": self.model_name}
+        if self.dimensions is not None:
+            request_kwargs["dimensions"] = self.dimensions
+        return request_kwargs
 
     @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
     def embed(self, text):
+        if not isinstance(text, str):
+            return self.embed_batch(text)
         text = text.replace("\n", " ")
-        return (
-            self.client.embeddings.create(input=[text], model=self.model_name)
-            .data[0]
-            .embedding
-        )
+        response = self.client.embeddings.create(input=[text], **self._request_kwargs())
+        return response.data[0].embedding
+
+    @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        texts = [text.replace("\n", " ") for text in texts]
+        if not texts:
+            return np.empty((0, 0), dtype=float)
+        response = self.client.embeddings.create(input=texts, **self._request_kwargs())
+        data = sorted(response.data, key=lambda item: item.index)
+        return np.asarray([item.embedding for item in data], dtype=float)
 
 
 class SentenceTransformersEmbeddingModel(BaseEmbeddingModel):
@@ -63,7 +117,11 @@ class SentenceTransformersEmbeddingModel(BaseEmbeddingModel):
         self.cache_dir = cache_dir
 
     def load_model(self):
-        if self.model is None:
+        if self.model is not None:
+            return
+        with self._load_lock:
+            if self.model is not None:
+                return
             if self.model_name in ["nvidia/NV-Embed-v2"]:
                 assert transformers.__version__ <= "4.46.0", "Use old transformers package (<= 4.46.0)."
                 self.model = SentenceTransformer(self.model_name, 
@@ -94,6 +152,12 @@ class SentenceTransformersEmbeddingModel(BaseEmbeddingModel):
             
         return self.model.encode(text, show_progress_bar=False, **kwargs)
 
+    def embed_batch(self, texts: List[str], **kwargs) -> np.ndarray:
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, 0), dtype=float)
+        return np.asarray(self.embed(texts, **kwargs), dtype=float).reshape(len(texts), -1)
+
 
 class OllamaEmbeddingModel(BaseEmbeddingModel):
     def __init__(self, model_name="qwen3", cache_dir=None, **kwargs):
@@ -118,6 +182,20 @@ class OllamaEmbeddingModel(BaseEmbeddingModel):
         embs = ollama.embed(**params).embeddings[0]
         return embs
 
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, 0), dtype=float)
+        params = {
+            "input": texts,
+            "options": self.model_kwargs,
+            "model": self.model_name,
+            "keep_alive": '10m',
+        }
+        if self.dimensions is not None:
+            params["dimensions"] = self.dimensions
+        return np.asarray(ollama.embed(**params).embeddings, dtype=float)
+
 
 class VLLMEmbeddingModel(BaseEmbeddingModel):
     def __init__(self, model_name="Qwen/Qwen3-Embedding-8B", cache_dir=None, **kwargs):
@@ -128,7 +206,11 @@ class VLLMEmbeddingModel(BaseEmbeddingModel):
         self.dimensions = self.model_kwargs.pop("dimensions", None)
 
     def load_model(self):
-        if self.model is None:
+        if self.model is not None:
+            return
+        with self._load_lock:
+            if self.model is not None:
+                return
             try:
                 from vllm import LLM
             except ImportError as e:
@@ -151,6 +233,12 @@ class VLLMEmbeddingModel(BaseEmbeddingModel):
             return embs[0]
         return np.asarray(embs)
 
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, 0), dtype=float)
+        return np.asarray(self.embed(texts), dtype=float).reshape(len(texts), -1)
+
 
 class TransformersEmbeddingModel(BaseEmbeddingModel):
     def __init__(self, model_name="facebook/contriever", cache_dir=None, **kwargs):
@@ -168,6 +256,12 @@ class TransformersEmbeddingModel(BaseEmbeddingModel):
             assert transformers.__version__ <= "4.46.0", "Use old transformers package (<= 4.46.0)."
 
     def load_model(self):
+        if self.model is not None and self.tokenizer is not None:
+            return
+        with self._load_lock:
+            self._load_model_unlocked()
+
+    def _load_model_unlocked(self):
         if self.model is None:
             model_init_params = {
                 "trust_remote_code": True,
@@ -191,6 +285,14 @@ class TransformersEmbeddingModel(BaseEmbeddingModel):
             return self._embed_contriever(text, **kwargs)
         elif self.model_name in ("nvidia/NV-Embed-v2"):
             return self._embed_nvidia(text, **kwargs)
+
+    def embed_batch(self, texts: List[str], **kwargs) -> np.ndarray:
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, 0), dtype=float)
+        if self.model_name in ("nvidia/NV-Embed-v2",):
+            return np.asarray(self.embed(texts, **kwargs), dtype=float).reshape(len(texts), -1)
+        return super().embed_batch(texts)
 
     def _embed_contriever(self, text, **kwargs):
         kwargs.setdefault("normalize", True)

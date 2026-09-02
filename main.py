@@ -15,6 +15,7 @@ from src import (
     Evaluator,
     HopDiscriminator,
     OpenAIAbstractModel,
+    OpenAIEmbeddingModel,
     OpenAIQAModel,
     OllamaAbstractModel,
     OllamaEmbeddingModel,
@@ -29,6 +30,7 @@ from src import (
     TransformersQAModel,
     TransformersRerankModel,
 )
+from src.dataset import split_dataset
 from src.prompt import AgentPrompt, get_qa_template
 from src.utils import (
     get_token_length,
@@ -59,27 +61,6 @@ def main():
         else:
             passages = data.get_documents()
         tqdm.write(f"Dataset token stats: {get_token_length(passages)}")
-
-    if isinstance(data.all_passages, str):
-        conf["passage_as_tree"] = True
-        conf["force_split"] = True
-        data.split_text(
-            tokenizer=conf["tokenizer"],
-            max_tokens=conf["max_tokens_per_chunk"],
-        )
-    elif isinstance(data.all_passages, List) and isinstance(data.all_passages[0], str):
-        if conf["passage_as_tree"] or conf["force_split"]:
-            conf["force_split"] = True
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
-    elif isinstance(data.all_passages[0], List):
-        if conf["force_split"]:
-            data.split_text(
-                tokenizer=conf["tokenizer"],
-                max_tokens=conf["max_tokens_per_chunk"],
-            )
 
     top_k = (
         min(conf["tree_top_k"], conf["rerank_top_k"])
@@ -121,6 +102,7 @@ def main():
                     "rerank": VLLMRerankModel,
                 },
                 "api": {
+                    "embed": OpenAIEmbeddingModel,
                     "abs": OpenAIAbstractModel,
                     "qa": OpenAIQAModel,
                 },
@@ -152,6 +134,9 @@ def main():
         for model_type in models_to_prepare:
             task_type = model_type.rsplit("_name", maxsplit=1)[0]
             conf[f"{task_type}_model"] = set_model(conf[model_type], task_type)
+
+        # Split after the models are ready: semantic chunking embeds every sentence.
+        split_dataset(data, conf)
 
         tree_rag = None
         if not conf["no_retrieval"]:

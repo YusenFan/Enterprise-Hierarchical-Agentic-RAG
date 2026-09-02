@@ -5,6 +5,41 @@ from typing import Sequence, Dict, TypedDict
 from pathlib import Path
 
 
+def load_env_file(path: str | Path | None = None, override: bool = False) -> Dict[str, str]:
+    """
+    Load KEY=VALUE pairs from a ".env" file into os.environ (no extra dependency).
+    Defaults to "<repo root>/.env". Variables already exported in the shell win
+    unless override=True. Used for OPENAI_BASE_URL / OPENAI_API_KEY of the "api:" backends.
+    """
+    if path is None:
+        path = Path(__file__).resolve().parent.parent / ".env"
+    path = Path(path)
+    loaded: Dict[str, str] = {}
+    if not path.is_file():
+        return loaded
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, value = line.split("=", maxsplit=1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", maxsplit=1)[0].rstrip()
+        if not key or value == "":   # "KEY=" means unset
+            continue
+        if override or key not in os.environ:
+            os.environ[key] = value
+        loaded[key] = value
+    return loaded
+
+
+load_env_file()
+
+
 class Config(TypedDict, total=False):
     # ===================================== Data config =====================================
     # Dataset name: "nq", "popqa", "hotpotqa", "2wikimultihopqa", "musique", 
@@ -35,11 +70,39 @@ class Config(TypedDict, total=False):
     tokenizer: str
     # Maximum token count of one chunk when tokenizer splits the data.
     max_tokens_per_chunk: int
+    # Chunking method used when the data is split, ("semantic", "static").
+    #   "static" packs sentences greedily up to max_tokens_per_chunk.
+    #   "semantic" embeds every sentence with the embedding model and starts a new chunk
+    #   where the distance between consecutive sentences spikes (still capped by
+    #   max_tokens_per_chunk). Requires the embedding model, so it is only effective
+    #   where the index is built (index.py / main.py); other scripts fall back to "static".
+    #   Semantic indexes are saved with a "_semantic" tag (tree file and bm25 directory).
+    chunking: str
+    # Split threshold for semantic chunking, interpreted according to semantic_threshold_type.
+    semantic_threshold: float
+    # ("percentile", "absolute"). "percentile": split where a sentence distance exceeds the
+    #   semantic_threshold-th percentile of the document's consecutive-sentence distances
+    #   (adapts to any embedding model). "absolute": split where distance > semantic_threshold.
+    semantic_threshold_type: str
+    # Metric for sentence / chunk distances in semantic chunking, ("cosine", "L1", "L2", "Linf").
+    semantic_distance: str
+    # Semantic chunks shorter than this many tokens are checked for merging: a short chunk is
+    #   merged into its more similar neighbour (left or right) only if it is not semantically
+    #   independent, i.e. that distance <= semantic_merge_threshold, and the merged chunk still
+    #   fits max_tokens_per_chunk. Independent short chunks are kept. Set to 0 to disable.
+    short_chunk_tokens: int
+    # Absolute distance below which a short chunk counts as "not independent" from its neighbour.
+    #   Default to None to reuse the document's effective split threshold.
+    semantic_merge_threshold: float | None
+    # Number of sentences per embedding call during semantic chunking.
+    semantic_embed_batch_size: int
 
     # =================================== Embedding config ===================================
     # Model name for embedding documents and queries, "[PLATFORM]:[MODEL_NAME_OR_PATH]"
-    #   e.g., "transformers:nvidia/NV-Embed-v2", "transformers:facebook/contriever", 
-    #   "sentence-transformers:multi-qa-mpnet-base-cos-v1", "ollama:qwen3-embedding"
+    #   e.g., "api:text-embedding-3-small" (OpenAI-compatible endpoint; set OPENAI_API_KEY and 
+    #   optionally OPENAI_BASE_URL in ".env"), "transformers:nvidia/NV-Embed-v2", 
+    #   "transformers:facebook/contriever", "sentence-transformers:multi-qa-mpnet-base-cos-v1", 
+    #   "ollama:qwen3-embedding"
     embed_name: str
     # Cache directory of the embedding model, default to os.environ["HF_HOME"].
     embed_cache_dir: Path
@@ -238,8 +301,15 @@ conf = Config(
     force_split=False,
     tokenizer="cl100k_base",
     max_tokens_per_chunk=100,
+    chunking="semantic",
+    semantic_threshold=90,
+    semantic_threshold_type="percentile",
+    semantic_distance="cosine",
+    short_chunk_tokens=30,
+    semantic_merge_threshold=None,
+    semantic_embed_batch_size=64,
     
-    embed_name="ollama:qwen3-embedding",
+    embed_name="api:text-embedding-3-small",
     embed_cache_dir=None,
     embed_model_kwargs={},
     

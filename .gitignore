@@ -7,5 +7,10 @@ logs
 conf/custom_conf.py
 data/wiki18*
 output/*
-!output/results/
+output/results/
 !output/results/**
+
+.venv/
+.env
+
+
