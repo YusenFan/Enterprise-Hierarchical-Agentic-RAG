@@ -1,0 +1,23 @@
+summary:
+Introductory discovery between Redwood and Tethys Systems to evaluate a channel+SI partnership. Action items: share partner packet, schedule executive alignment next week.
+
+transcript:
+Meeting Header
+Date: 2026-01-14
+Start time: 10:03 AM PT
+Duration: 43 minutes
+Agenda: listing requirements, security docs, timelines
+Attendees (Redwood): Jordan Blake, Soojin Lee, Chris Osei
+Attendees (AWS): Megan Li, Andrew Patel
+
+Auto Summary (Fireflies)
+- Discussed required listing fields and attachments for SaaS offers.
+
+[00:00] Jordan Blake: Cool. Hey everyone, thanks for making the time. Goal today is to make sure we don't get bounced in the first review cycle.
+[00:10] Megan Li: Hi, Megan here from the Marketplace team.
+[00:19] Andrew Patel: Andrew, security review.
+[41:02] Speaker 2: (inaudible)
+[42:30] Jordan Blake: Great, we'll target end-of-month submission.
+
+action_items:
+- Jordan to send the attachment bundle by 2026-01-21

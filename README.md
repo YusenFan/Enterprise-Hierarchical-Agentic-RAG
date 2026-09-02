@@ -371,6 +371,46 @@ Detailed stats include:
 
 </details>
 
+## EnterpriseRAG-Bench with Metadata-Aware Ingestion
+
+<details>
+    <summary>Documents, leaf nodes and abstract nodes carry structured metadata</summary>
+
+### Metadata-aware ingestion
+
+[EnterpriseRAG-Bench](https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench) (put it under `data/enterpriseRAG-Bench/`) ships 512k Slack / Gmail / Jira / Linear / GitHub / Confluence / Google Drive / HubSpot / Fireflies documents whose only structured fields are `doc_id`, `source_type`, `title` and `content`. The ingestion pipeline parses the rest with **rule-based, per-source parsers** (`src/metadata/parsers/`, no LLM calls) and keeps three distinct objects:
+
+| Object | Where | Fields |
+|---|---|---|
+| `Document` (authoritative metadata) | `tree.documents[doc_id]` (`src/metadata/document.py`) | `authors`, `participants`, `channel`, `projects`, `entities`, `ticket_keys`, `emails`, `created_at`, `updated_at`, `time_range`, `extra` (source-specific: subject, attendees by group, account, sections, ...) |
+| Leaf node (raw chunk) | `Node` | `document_id`, `local_metadata` (speakers / section / message sender of *this* chunk) |
+| Abstract node (semantic cluster) | `Node` | `source_refs` (`[{document_id, chunk_ids}]`), `source_document_ids`, `aggregated_metadata` (authors, participants, projects, entities, ticket keys, channels, source types, time range, latest update, source authority) |
+
+The document hierarchy and the semantic tree stay separate: nodes reference documents through `document_id` / `source_refs`, and `src.metadata.aggregate_tree_metadata` fills the abstract nodes bottom-up once, after any tree builder has finished. Layer-1 nodes summarise a single document (`source_document_ids` has one entry); higher layers span several documents.
+
+Ingestion details worth knowing:
+
+- Gmail content is mostly a stringified list of messages with literal `\n`; Slack titles are channel names; Fireflies has a `Meeting Header` block; Jira / Linear / GitHub / HubSpot are `snake_case:` pseudo-YAML sections with an open key vocabulary; Confluence / Google Drive keep owners and Slack channels in `**Owners:**`-style label lines. All of this is handled in `src/metadata/parsers/`.
+- Dates of every shape (RFC 2822, ISO 8601, `Tue, Jun 3, 2025 at 9:12 AM PT`, ...) are normalised to ISO strings in `src/metadata/dates.py`, so `time_range` bounds sort lexicographically.
+- Projects / codenames come from the curated vocabulary in `conf/enterprise_projects.json`; HubSpot account names are added automatically. Ticket keys (`ENG-4129`, `INC-2147`, ...) become entities.
+- Every chunk is prefixed with its document title after chunking (`enterprise_chunk_title_prefix`), so channel / account / ticket titles reach every leaf and the BM25 index.
+
+### Subset, index, QA and evaluation
+
+`conf/enterprise_rag.py` indexes a reproducible **~5k-document subset**: every document referenced by a question (722) plus distractors sampled uniformly per source type (`enterprise_subset_size`, `enterprise_subset_seed`). The subset is streamed from the 1.4 GB parquet once and cached under `data/enterpriseRAG-Bench/subsets/`; the size and seed are part of the tree / BM25 index names.
+
+~~~bash
+python index.py --config enterprise_rag --force_index_from_scratch true
+python qa.py    --config enterprise_rag --test_samples 50   # qa.py and eval.py must use the same test_samples
+python eval.py  --config enterprise_rag --test_samples 50
+~~~
+
+- Retrieval returns provenance: `layer_information` carries `document_id`, `source_type`, `title` and `local_metadata`; with `context_metadata_header=True` every retrieved chunk is prefixed with `[doc: <id> | <source> | <title> | <date> | <author>]`, and the QA result file gains `sources` and `retrieved_doc_ids` (unique documents, best score first).
+- New evaluation metrics: `docrecall` (Recall@k against `expected_doc_ids`, questions without gold documents are skipped and counted), `extradocs` (retrieved documents that are not gold, lower is better) and `llmjudge` (`judge_name`, e.g. `api:gpt-4o-mini`: correctness x completeness over `answer_facts`, cached per answer in `<save_dir>/results/<config>_judge.json`). All three report a per-`question_type` breakdown.
+- `conf/enterprise_rag_smoke.py` runs the whole pipeline offline with hashed embeddings and fake LLMs (`hash:bow`, `fake:abstract`, `fake:qa`); `python -m pytest tests` covers the parsers, the aggregation, the subset sampler and the evaluation.
+
+</details>
+
 ## Layout
 
 <details>

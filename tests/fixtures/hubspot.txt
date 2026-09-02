@@ -1,0 +1,10 @@
+notes:
+Account background:\n- Mid-sized radiology network with 45 hospitals.\n- Building a diagnostic-assist platform.\n\nValue drivers: predictable unit economics. Contact: Alex Marino (CPO).
+
+next_step:
+Issue trial keys and shared benchmark harness, set POC start date (target 2026-03-16).
+
+timeline:
+2026-03-02 - Inbound signup: initial form from webinar
+2026-03-08: phone screener w/ Alex Marino (CPO) — Fireflies ff-20260308-orion-initial
+2026-03-12 - trial account created; see DEAL-771

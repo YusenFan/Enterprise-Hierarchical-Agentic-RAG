@@ -17,3 +17,7 @@ from .qa import (BaseQAModel,
 from .rerank import (BaseRerankModel,
                      TransformersRerankModel,
                      VLLMRerankModel,)
+from .fake import (HashEmbeddingModel,
+                   FakeAbstractModel,
+                   FakeQAModel,)
+from .factory import build_model, MODEL_CLASSES

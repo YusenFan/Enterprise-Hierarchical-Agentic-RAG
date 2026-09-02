@@ -2,10 +2,22 @@ import argparse
 
 from tqdm import tqdm
 
+import os
+
 from conf import apply_config_overrides, read_config
 from src import DataManager, Evaluator
-from src.dataset import split_dataset
+from src.dataset import enterprise_kwargs_from_conf, split_dataset
+from src.model.factory import build_model
 from src.utils import get_token_length, load_answers
+
+
+def build_judge(conf):
+    """Judge model for the "llmjudge" metric, or None when not configured / not requested."""
+    metrics = conf["evaluation_metrics"]
+    wanted = metrics == "all" or "llmjudge" in metrics
+    if not wanted or not conf.get("judge_name"):
+        return None
+    return build_model(conf["judge_name"], "judge", conf)
 
 
 def main():
@@ -16,6 +28,7 @@ def main():
         dataset_name=conf["dataset"],
         data_dir=conf["data_dir"],
         test_samples=conf["test_samples"],
+        enterprise_kwargs=enterprise_kwargs_from_conf(conf),
     )
 
     if conf.get("tree_build_diagnostics"):
@@ -34,7 +47,17 @@ def main():
         if conf["rerank_top_k"] is not None
         else conf["tree_top_k"]
     )
-    evaluator = Evaluator(data=data, top_k_nodes_per_layer=top_k)
+    judge_cache_path = (
+        os.path.join(conf["save_dir"], "results", f'{conf["config"]}_judge.json')
+        if conf["save_dir"] is not None else None
+    )
+    evaluator = Evaluator(
+        data=data,
+        top_k_nodes_per_layer=top_k,
+        judge_model=build_judge(conf),
+        judge_workers=conf.get("judge_workers", 8),
+        judge_cache_path=judge_cache_path,
+    )
 
     results = None
     if conf["save_dir"] is not None:
@@ -50,6 +73,7 @@ def main():
     scores = evaluator.evaluate(
         answers=results.get("answers", None),
         retrieved_docs=results.get("retrieved_docs", None),
+        retrieved_doc_ids=results.get("retrieved_doc_ids", None),
         metrics=conf["evaluation_metrics"],
     )
 

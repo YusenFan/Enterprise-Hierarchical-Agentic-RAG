@@ -1,0 +1,26 @@
+description:
+Issue summary:
+Customer deployed a new quantization profile (qp-2026-03-13-v3) and enabled kv_prefetch=true. Within ~30 minutes they observed a sharp increase in P95 token latency for LexiHealth's triage assistant flows.
+
+Impact:
+- Increased P95 token latency across affected model variants.
+
+Environment:
+- Redwood Dedicated pool: rwd-dedicated-lexi-01 (prod us-east)
+
+Customer: LexiHealth
+
+Recent changes (per customer):
+1) Applied quant profile via Console rollout at 2026-03-13T13:22:00Z.
+
+reporter: Dana Whitfield
+assignee: Marcus Lin
+
+comments:
+2026-03-13T15:02:00Z Marcus Lin: Reproduced on staging, see SUP-2211 and ENG-4187.
+
+logs:
+2026-03-13T14:12:03Z request_id=02c9 status=504 backend_error=kv_lookup_timeout shard=kv-shard-7
+
+resolution_notes:
+Rolled back qp-2026-03-13-v3 on 2026-03-14.

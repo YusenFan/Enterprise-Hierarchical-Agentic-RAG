@@ -1,0 +1,13 @@
+TL;DR:
+We ran a small set of controlled playback tests to compare dispatch semantics across edge-forward dispatch and core-tiling multiplexing.
+
+Why we ran this (context):
+- Product asks for a short, shareable comparison to inform routing policy defaults.
+
+Experiment setup (short):
+- Date: 2026-05-15 to 2026-05-17.
+- Hardware: G-core (A100x2) for core tiles.
+- Owner: Priya Natarajan
+
+Results
+- edge-dispatch-prefetch gives best p50 and p95 for short responses.

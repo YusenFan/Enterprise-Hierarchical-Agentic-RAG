@@ -278,8 +278,34 @@ class Config(TypedDict, total=False):
     #   Used only when Qwen3-Reranker-8B OOMs as this reranker does not support auto device mapping.
     rerank_batch_size: int
 
+    # ================================ EnterpriseRAG-Bench config ==============================
+    # Directory of the benchmark (contains data/documents/test.parquet, data/questions/test.parquet).
+    enterprise_data_dir: Path
+    # Number of documents to index: every document referenced by a question is kept, the rest of
+    #   the budget is sampled uniformly per source type. None = the full corpus (512k documents).
+    enterprise_subset_size: int | None
+    # Random seed of the distractor sampling (part of the index file name).
+    enterprise_subset_seed: int
+    # Where the sampled subset is cached (None -> <enterprise_data_dir>/subsets).
+    enterprise_subset_cache_dir: Path | None
+    # Curated project / codename vocabulary used by the rule-based metadata parsers (None = empty).
+    enterprise_project_vocab: Path | None
+    # Prefix every chunk with the document title (channel / account / ticket title) after chunking.
+    enterprise_chunk_title_prefix: bool
+    # Heuristic authority rank per source type stored in abstract nodes' aggregated_metadata.
+    enterprise_source_authority: Dict[str, int]
+    # Prepend "[doc: id | source | title | date | author]" to every retrieved chunk in the QA context.
+    context_metadata_header: bool
+    # LLM judge for EnterpriseRAG-Bench answers ("api:gpt-4o-mini" style name, None = disabled).
+    judge_name: str | None
+    judge_cache_dir: Path | None
+    judge_model_kwargs: Dict
+    # Parallel judge calls.
+    judge_workers: int
+
     # ===================================== Other config ======================================
-    # Set of evaluation metrics, ("em", "f1", "rouge", "recall", "answerrate")
+    # Set of evaluation metrics, ("em", "f1", "rouge", "recall", "answerrate",
+    #   "docrecall", "extradocs", "llmjudge"). The last three need EnterpriseRAG-Bench labels.
     #   Default to "all" to use all supported metrics.
     evaluation_metrics: str | Sequence[str]
     # Save directory of everything intermediate: tree, BM25 vocab, QA results, etc. 
@@ -368,6 +394,22 @@ conf = Config(
     rerank_top_k=5,
     rerank_threshold=None,
     rerank_batch_size=-1,
+
+    enterprise_data_dir="./data/enterpriseRAG-Bench",
+    enterprise_subset_size=5000,
+    enterprise_subset_seed=42,
+    enterprise_subset_cache_dir=None,
+    enterprise_project_vocab="./conf/enterprise_projects.json",
+    enterprise_chunk_title_prefix=True,
+    enterprise_source_authority={
+        "confluence": 5, "google_drive": 4, "jira": 3, "linear": 3, "github": 3,
+        "gmail": 2, "fireflies": 2, "hubspot": 2, "slack": 1,
+    },
+    context_metadata_header=False,
+    judge_name=None,
+    judge_cache_dir=None,
+    judge_model_kwargs={},
+    judge_workers=8,
 
     evaluation_metrics="all",
 

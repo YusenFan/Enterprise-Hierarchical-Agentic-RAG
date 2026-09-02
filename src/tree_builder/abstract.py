@@ -320,7 +320,7 @@ class AbstractTreeBuilder(TreeBuilder):
         if use_multithreading:
             passage_batch_size = 10
             bar = tqdm(
-                range(0, max(list(passage_to_node_indices.keys())), passage_batch_size),
+                range(0, max(list(passage_to_node_indices.keys())) + 1, passage_batch_size),
                 desc="generating 1st-layer abstracts",
             )
             for i in bar:

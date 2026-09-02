@@ -23,31 +23,58 @@ logging.basicConfig(format="%(asctime)s - %(message)s",
 class Node:
     """
     Represents a node in the hierarchical tree structure.
+
+    Leaf nodes (no children) are raw chunks: `document_index` / `chunk_index` are positions in the
+    corpus, `document_id` references the source `Document` (see src/metadata) and `local_metadata`
+    holds cheap chunk-level facts (speakers, section, ...). Abstract nodes (with children) carry
+    `source_refs` ([{"document_id", "chunk_ids"}]), `source_document_ids` and `aggregated_metadata`,
+    filled by `src.metadata.aggregate_tree_metadata`. The class-level defaults keep trees pickled
+    before these fields existed loadable.
     """
 
-    def __init__(self, text: str, index: int, document_index: int, chunk_index: int, children: Set[int], embeddings: np.ndarray) -> None:
+    document_id: Optional[str] = None
+    local_metadata: Optional[Dict] = None
+    source_refs: Optional[List[Dict]] = None
+    source_document_ids: Optional[List[str]] = None
+    aggregated_metadata: Optional[Dict] = None
+
+    def __init__(self, text: str, index: int, document_index: int, chunk_index: int, children: Set[int], embeddings: np.ndarray,
+                 *, document_id: Optional[str] = None, local_metadata: Optional[Dict] = None) -> None:
         self.text: str = text
         self.index: int = index
         self.document_index: int = document_index
         self.chunk_index: int = chunk_index
         self.children: Set[int] = children
         self.embeddings: np.ndarray = embeddings
+        if document_id is not None:
+            self.document_id = document_id
+        if local_metadata is not None:
+            self.local_metadata = local_metadata
+
+    @property
+    def is_leaf(self) -> bool:
+        return not self.children
 
 
 class Tree:
     """
     Represents the entire hierarchical tree structure.
+    `documents` (optional) maps document_id -> Document for provenance / context headers.
     """
 
+    documents: Optional[Dict] = None
+
     def __init__(
-        self, all_nodes, root_nodes, leaf_nodes, layer_to_node_indices
+        self, all_nodes, root_nodes, leaf_nodes, layer_to_node_indices, documents: Optional[Dict] = None
     ) -> None:
-        self.all_nodes: List[Node] = all_nodes
-        self.root_nodes: List[Node] = root_nodes
-        self.leaf_nodes: List[Node] = leaf_nodes
+        self.all_nodes: Dict[int, Node] = all_nodes
+        self.root_nodes: Dict[int, Node] = root_nodes
+        self.leaf_nodes: Dict[int, Node] = leaf_nodes
         self.num_layers: int = max(layer_to_node_indices.keys())
         # self.num_layers = num_layers
         self.layer_to_node_indices: Dict[int, List[int]] = layer_to_node_indices
+        if documents is not None:
+            self.documents = documents
 
 
 def reverse_mapping(layer_to_node_indices: Dict[int, List[int]]) -> Dict[int, int]:
@@ -648,9 +675,22 @@ def sanitize_save_name(name: str) -> str:
     return name
 
 
+def dataset_tag(conf: Dict) -> str:
+    """
+    Dataset part of index / result file names. EnterpriseRAG-Bench subsets are tagged with their
+    size and seed so a tree and a BM25 index built on different subsets can never be paired.
+    """
+    dataset = conf["dataset"]
+    if dataset == "enterprise_rag":
+        size = conf.get("enterprise_subset_size")
+        seed = conf.get("enterprise_subset_seed", 42)
+        return "enterprise_rag_full" if size is None else f"enterprise_rag_n{size}_s{seed}"
+    return dataset
+
+
 def get_tree_save_name(conf: Dict) -> str:
     prefix = (
-        f'{conf["dataset"]}_{conf["embed_name"].replace("/", "_")}'
+        f'{dataset_tag(conf)}_{conf["embed_name"].replace("/", "_")}'
         f'_{str(conf["abs_name"]).replace("/", "_")}_{conf["abstract_type"]}'
     )
     if conf.get("chunking") == "semantic":
@@ -666,7 +706,7 @@ def get_tree_save_name(conf: Dict) -> str:
 
 def get_sparse_save_name(conf: Dict) -> str:
     """Directory name of the BM25 index. Tagged like the tree so both always match."""
-    name = f"bm25_{conf['dataset']}"
+    name = f"bm25_{dataset_tag(conf)}"
     if conf.get("chunking") == "semantic":
         name = f"{name}_semantic"
     return name

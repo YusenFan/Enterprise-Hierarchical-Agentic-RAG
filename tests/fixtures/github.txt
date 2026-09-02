@@ -1,0 +1,8 @@
+release_notes:
+Adds a pluggable attention adapter and a fused rope->rotary stitching path. Backwards-compatible fallbacks retained.
+
+description:
+Motivation: address two customer-visible mismatches across SDKs. Related work: Linear ENG-4129, ENG-4187. Uses SHA-256 digests and GPT-4o for docs.
+
+review_comments:
+Jordan Kim: Noted a race when background refresh happens concurrent with stream resume; requested deterministic test. Priya Nair: added deterministic barrier in integration test. Luis Martinez: asked for tighter typing in the Go SDK.
