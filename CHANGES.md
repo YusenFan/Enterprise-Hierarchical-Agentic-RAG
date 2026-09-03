@@ -99,7 +99,33 @@ What the numbers say (n800 = 722 gold documents + only 78 distractors, so constr
 - The level term (δ) trades R@5 for R@1 / MRR (document-level nodes get credited); redundancy (λ=0.3) helps consistently.
 - The hard filter (D) hurts everywhere (test R@5 0.842), even with source systems restricted to explicit names: questions describe the information, not the system, and document dates are often missing or broad. Relaxation never triggered (the pool stayed ≥ top_k).
 - The metadata-in-text index (B) alone ≈ legacy; BC3 vs C3 flips sign between dev (0.910 vs 0.930) and test (0.928 vs 0.913) — noise-level on this subset.
-- QA + LLM-judge runs of A0 / C0 / C3 / D / Cbest / B / BC3 on the test split (`experiments/qa_arms_n800.sh`, results as `output/results/enterprise_rag_<arm>.json`) were started; merge them with `python experiments/summarize_n800.py --config enterprise_rag --enterprise_subset_size 800 --split test --exp-dirs output/experiments/n800_test output/experiments/n800_test_b --qa-tags A0,C0,C3,D,Cbest,B,BC3` → `output/experiments/n800_summary_test.md`.
+**QA + LLM judge on the test split** (350 questions, agentic QA `max_retrieval_time=1`, gpt-4o-mini answers and judge; `experiments/qa_arms_n800.sh`, merged by `experiments/summarize_n800.py` → `output/experiments/n800_summary_test.md`). C3 / D use the default weights (γ 0.5, δ 0.3, λ 0.3); Cbest uses the dev-grid weights.
+
+| arm | JudgeOverall | JudgeCorrectness | JudgeCompleteness | F1 | DocRecall@5 | DocMRR |
+|---|---|---|---|---|---|---|
+| A0 legacy | 0.3027 | 0.3600 | 0.3977 | 0.2681 | 0.9064 | 0.7970 |
+| C0 collapsed hybrid, no metadata | **0.3202** | **0.3886** | **0.4023** | 0.2585 | 0.9134 | **0.9355** |
+| C3 full soft score | 0.2911 | 0.3543 | 0.3791 | 0.2654 | 0.9021 | 0.9172 |
+| Cbest dev-grid weights | 0.2698 | 0.3314 | 0.3707 | 0.2550 | **0.9156** | 0.9240 |
+| D hard filter | 0.2827 | 0.3429 | 0.3653 | 0.2468 | 0.8495 | 0.8700 |
+| B metatext index, legacy | 0.3077 | 0.3743 | 0.3994 | **0.2699** | 0.8938 | 0.7828 |
+| BC3 metatext + full soft score | 0.2977 | 0.3600 | 0.3855 | 0.2598 | 0.8992 | 0.8999 |
+
+JudgeOverall by question type (n: basic 123, semantic 87, intra_document_reasoning 28, project_related 28, constrained 21, completeness / conflicting_info / info_not_found / miscellaneous 14, high_level 7):
+
+| arm | basic | completeness | conflicting_info | constrained | high_level | info_not_found | intra_doc | misc | project_related | semantic |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A0 | 0.458 | 0.000 | 0.129 | 0.084 | 0.000 | 0.071 | 0.628 | 0.464 | 0.014 | 0.237 |
+| C0 | 0.472 | 0.107 | 0.119 | 0.080 | 0.000 | 0.143 | 0.773 | 0.554 | 0.024 | 0.197 |
+| C3 | 0.401 | 0.036 | 0.119 | 0.152 | 0.000 | 0.071 | 0.660 | 0.607 | 0.000 | 0.221 |
+| Cbest | 0.392 | 0.036 | 0.109 | 0.058 | 0.000 | 0.071 | 0.604 | 0.607 | 0.000 | 0.191 |
+| D | 0.417 | 0.036 | 0.160 | 0.077 | 0.000 | 0.071 | 0.625 | 0.661 | 0.000 | 0.179 |
+| B | 0.478 | 0.036 | 0.149 | 0.102 | 0.000 | 0.000 | 0.747 | 0.557 | 0.018 | 0.172 |
+| BC3 | 0.414 | 0.036 | 0.109 | 0.066 | 0.000 | 0.071 | 0.676 | 0.632 | 0.018 | 0.236 |
+
+- Only C0 improves answers as well as retrieval (JudgeOverall +0.018 over legacy, MRR +0.14). Every metadata arm (C3, Cbest, D, B, BC3) is at or below the legacy judge score even where its retrieval metrics are higher: the QA context is 10 nodes either way, and the metadata terms swap leaf chunks for document-level abstracts or metadata-matched chunks that the answer model uses less well.
+- C3 is the only arm that lifts `constrained` questions (0.152 vs 0.084), matching the retrieval picture; it loses on `basic`. `high_level` scores 0 for every arm and `project_related` / `completeness` stay near 0: these need multi-document synthesis, not better single-document ranking.
+- The first attempt at C3 / D / Cbest died on a transient `APIConnectionError` (tenacity `RetryError` propagates out of the threaded QA loop and aborts the whole run); a per-question retry / skip in `qa.py` would make long runs robust. The three arms were re-run with `experiments/qa_arms_n800_rerun.sh`.
 
 ## Files
 
