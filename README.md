@@ -409,6 +409,30 @@ python eval.py  --config enterprise_rag --test_samples 50
 - New evaluation metrics: `docrecall` (Recall@k against `expected_doc_ids`, questions without gold documents are skipped and counted), `extradocs` (retrieved documents that are not gold, lower is better) and `llmjudge` (`judge_name`, e.g. `api:gpt-4o-mini`: correctness x completeness over `answer_facts`, cached per answer in `<save_dir>/results/<config>_judge.json`). All three report a per-`question_type` breakdown.
 - `conf/enterprise_rag_smoke.py` runs the whole pipeline offline with hashed embeddings and fake LLMs (`hash:bow`, `fake:abstract`, `fake:qa`); `python -m pytest tests` covers the parsers, the aggregation, the subset sampler and the evaluation.
 
+### Metadata-aware query (phase 2)
+
+The retriever has a second mode, `retrieve_mode="hybrid_score"`, that uses the stored metadata at query time:
+
+    Score(q, n) = α·S_dense + β·S_BM25 + γ·S_metadata + δ·S_level − λ·S_redundancy
+
+- **Query understanding** (`src/query/understanding.py`, `query_understanding` = `none` / `rules` / `llm`): people, projects, entities, ticket keys, a date window ("Feb 12, 2026", "Q4 2025", "early March 2026", `src/query/time_expressions.py`) and *explicitly named* source systems. `llm` makes one JSON call to `query_name` (cached per question under `<save_dir>/query_cache/`) and merges it with the rules.
+- **Candidates** (`src/query/candidates.py`, `candidate_mode`): `collapsed` = dense top-N over every node of every layer (a cached, normalised matrix, `.dense.npz` next to the tree) ∪ BM25 top-N leaves and their parents; `traversal` = the nodes visited by the legacy top-down search ∪ BM25 hits. Abstract nodes get the max BM25 score of their leaves. The pool is keyed by node index.
+- **Terms** (`src/query/scoring.py`): `S_metadata` is a weighted mean of per-field matches over the fields the query specifies (`metadata_field_weights`; time = overlap coefficient with `time_tolerance_days`); `S_level` maps the benchmark `question_type` to a layer preference (`level_preference`); `S_redundancy` is an MMR penalty (ancestor / descendant = 1, same document = 0.5). `score_weights` holds α..λ.
+- **Hard filter** (`metadata_filter=True`, arm D): a corpus-wide mask on `hard_filter_fields` (ticket keys, time window with `hard_time_tolerance_days`, source type); unknown metadata never fails a filter, and the filter is relaxed step by step when fewer than `rerank_top_k` nodes survive.
+- **Metadata-in-text index** (arm B, `conf/enterprise_rag_metatext.py`): `enterprise_chunk_metadata_prefix=True` writes `[source | title | date | who | projects | tickets]` into every chunk and the aggregated header into every abstract *before* embedding / BM25; index files get a `_metatext` tag.
+- **Document credit**: abstract nodes count toward `retrieved_doc_ids` only when they cover at most `source_max_abstract_docs` documents; `retrieved_doc_ids_leaf_only` is saved as well. New metrics `docmrr`, `docndcg` (+ `DocRecallLeaf@k`).
+- `run_tag` suffixes result / log / judge-cache names so variants of one config coexist; `enterprise_split` = `dev` / `test` (`python experiments/make_splits.py`, stratified 30 / 70 by question type).
+
+~~~bash
+python experiments/make_splits.py
+python experiments/run_arms.py --config enterprise_rag --split dev --grid --field-ablation      # retrieval-only arms, weight grid, per-field ablation
+python experiments/run_arms.py --config enterprise_rag --split test --weights-from output/experiments/enterprise_rag_dev/grid.json
+python qa.py   --config enterprise_rag --enterprise_split test --retrieve_mode hybrid_score --run_tag C3
+python eval.py --config enterprise_rag --enterprise_split test --run_tag C3
+~~~
+
+Arms in `experiments/run_arms.py`: `A0` legacy traversal + RRF, `C0` hybrid score without metadata, `C1`/`C1r` + metadata (LLM / rules parse), `C2` + level, `C3` full soft score, `C3t` traversal candidates, `D` hard filter, `B` / `BC3` metadata-in-text index. `retrieve_mode="legacy"` (the default) is unchanged.
+
 </details>
 
 ## Layout

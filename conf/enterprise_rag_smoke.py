@@ -25,8 +25,9 @@ conf = {
     "sparse_top_k": 10,
     "rerank_top_k": 10,
     "context_metadata_header": True,
+    "query_understanding": "rules",         # offline query parsing (no LLM)
 
-    "evaluation_metrics": ["docrecall", "extradocs", "f1", "answerrate"],
+    "evaluation_metrics": ["docrecall", "docmrr", "docndcg", "extradocs", "f1", "answerrate"],
     "multithreading_qa_batch_size": -1,
     "save_dir": "./output/smoke",
     "force_index_from_scratch": True,

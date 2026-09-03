@@ -97,3 +97,37 @@ def test_retrieval_provenance(built):
     sources = collect_sources(rag.tree, {e["node_index"]: e["score"] for e in info})
     ids = [s["document_id"] for s in sources]
     assert len(ids) == len(set(ids)) and set(ids) <= set(rag.tree.documents)
+
+
+def test_metadata_in_text_index(tmp_path_factory):
+    """Arm B: the header is written into every chunk and abstract, index names get the _metatext tag."""
+    from src.utils import get_sparse_save_name, get_tree_save_name
+    root = tmp_path_factory.mktemp("bench_meta")
+    data_dir = make_dataset(str(root / "bench"), n_per_type=4)
+    enrich(data_dir)
+    conf = read_config("enterprise_rag_smoke")
+    conf.update({
+        "enterprise_data_dir": data_dir, "enterprise_subset_size": 20,
+        "enterprise_subset_cache_dir": str(root / "cache"), "save_dir": None, "test_samples": -1,
+        "tree_top_k": 3, "sparse_top_k": 3, "rerank_top_k": 3, "max_tokens_per_chunk": 60,
+        "enterprise_chunk_metadata_prefix": True, "retrieve_mode": "hybrid_score",
+    })
+    assert get_tree_save_name(conf).endswith("_metatext_tree.pkl") and get_sparse_save_name(conf).endswith("_metatext")
+    data = DataManager("enterprise_rag", data_dir=conf["data_dir"], test_samples=conf["test_samples"],
+                       enterprise_kwargs=enterprise_kwargs_from_conf(conf))
+    for task in ("embed", "abs", "qa"):
+        conf[f"{task}_model"] = build_model(conf[f"{task}_name"], task, conf)
+    split_dataset(data, conf)
+    for doc, chunks in zip(data.documents, data.all_passages):
+        assert all(chunk.startswith(f"[{doc.source_type} | ") for chunk in chunks)
+    rag = RAG(conf)
+    rag.add_documents(data)
+    rag.build_vocab(data)
+    tree = rag.tree
+    abstracts = [tree.all_nodes[i] for layer, ids in tree.layer_to_node_indices.items() if layer > 0 for i in ids]
+    assert abstracts and all(n.text.startswith("[summary | ") for n in abstracts)
+    assert all(n.embeddings is not None for n in abstracts)
+    assert data.get_documents()[0] == tree.all_nodes[0].text          # BM25 text == tree text
+    context, info = rag.retrieve("private upgrade rollback audit log", 0)
+    assert context and not any(c.startswith("[doc: ") for c in context)   # no second header at query time
+    assert all("sub_scores" in entry for entry in info)

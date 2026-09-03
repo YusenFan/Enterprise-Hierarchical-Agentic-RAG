@@ -137,17 +137,38 @@ def format_context_header(node, doc: Optional[Document] = None) -> str:
     return f"[doc: {document_id} | {doc.source_type} | {doc.title} | {date} | {who}]"
 
 
-def collect_sources(tree, node_scores: Dict[int, float], limit: Optional[int] = None) -> List[Dict]:
+def document_text_header(doc: Document, max_items: int = 4) -> str:
+    """
+    One-line metadata header written INTO the chunk text before embedding / BM25 indexing
+    (metadata-in-text index, arm B): "[source | title | date | who | projects | tickets]".
+    """
+    md = doc.metadata
+    date = md.created_at or (md.time_range.start if md.time_range else None)
+    who = ", ".join(md.authors[:max_items]) if md.authors else (f"#{md.channel}" if md.channel else "")
+    parts = [doc.source_type, doc.title or "", (date or "")[:10], who]
+    if md.projects:
+        parts.append("projects: " + ", ".join(md.projects[:max_items]))
+    if md.ticket_keys:
+        parts.append("tickets: " + ", ".join(md.ticket_keys[:max_items]))
+    return "[" + " | ".join(p for p in parts if p) + "]"
+
+
+def collect_sources(tree, node_scores: Dict[int, float], limit: Optional[int] = None,
+                    max_abstract_docs: Optional[int] = None) -> List[Dict]:
     """
     Map retrieved node indices (with scores) to unique source documents, best score first.
-    Abstract nodes contribute all of their source documents.
+    Abstract nodes contribute all of their source documents, unless they cover more than
+    `max_abstract_docs` documents (then they contribute nothing).
     """
     registry = getattr(tree, "documents", None) or {}
     best: Dict[str, float] = {}
     order: List[str] = []
     for index, score in node_scores.items():
         node = tree.all_nodes[index]
-        for document_id in node_document_ids(node):
+        document_ids = node_document_ids(node)
+        if node.children and max_abstract_docs is not None and len(document_ids) > max_abstract_docs:
+            continue
+        for document_id in document_ids:
             if document_id not in best:
                 order.append(document_id)
                 best[document_id] = score

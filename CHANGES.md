@@ -1,3 +1,118 @@
+# Change Record — 2026-09-03
+
+**Metadata-aware query for EnterpriseRAG-Bench (phase 2: query side).** Structured query understanding, the hybrid score `α·dense + β·BM25 + γ·metadata + δ·level − λ·redundancy` with MMR selection, a corpus-wide hard filter, a metadata-in-text index variant, document-level MRR / nDCG, dev / test splits and a retrieval-only experiment runner. The legacy retriever path is byte-for-byte unchanged (verified against the saved smoke results and the real n800 results).
+
+## 1. Query understanding (`src/query/understanding.py`, `src/query/time_expressions.py`, `src/prompt/rag_query.py`)
+
+- `QueryConstraints`: intent, keywords, entities, people, projects, ticket keys, `time_range`, source types, channels. `parse_query_rules` (dates incl. quarters / halves / "early March 2026", ticket regex, project vocabulary + HubSpot accounts of the tree, hinted person names, explicit system names only), `normalize_llm_output` + `merge_constraints` (union, LLM window wins), `QueryUnderstanding` (mode `none` / `rules` / `llm`; sha1-keyed JSON cache `<save_dir>/query_cache/<model>_<prompt version>.json`, thread-safe). Trees without `documents` never call the model.
+- Source systems are extracted only when named explicitly: content words (ticket, meeting, channel, pull request, deal, listing, ...) mislead on this benchmark (dev diagnostics, see §7).
+
+## 2. Scoring and candidates (`src/query/scoring.py`, `src/query/candidates.py`, `src/query/credit.py`)
+
+- `MetadataIndex` (per-node `NodeMetadataView`, source-type bits, ordinal-day intervals, ticket → nodes), `metadata_match` (weighted mean over specified fields; time = overlap coefficient), `level_score`, `TreeRelations` (ancestor / same-document), `select_with_mmr`, `hard_mask` with relaxation (`widen_time` → `drop_time` → `drop_source_type` → `drop_ticket_keys`).
+- `DenseIndex` (normalised float32 matrix over all nodes, optional `.dense.npz` sidecar), `SparseScorer` (bm25s score vector, abstract = max over leaf descendants), `build_candidate_pool` keyed by node index.
+- `merge_node_scores` (all layers in hybrid mode), `document_credit` (abstract nodes credit their documents only when `num_documents <= source_max_abstract_docs`; leaf-only variant).
+
+## 3. Retriever (`src/tree_retriever.py`)
+
+- `retrieve_mode="hybrid_score"` → `_retrieve_hybrid_score` (parse → dense sims + BM25 vector → pool with optional hard mask → metadata / level terms → MMR); `candidate_mode` `collapsed` / `traversal` (`_traverse` records every visited node; `_tree_retrieve` is a wrapper). `retrieve(..., extras=None, question_type=None)`; `layer_information` entries gain `sub_scores`; timing gains `parse` / `score`.
+- Legacy path: `rrf_k` is now threaded into `rrf`; the runtime provenance header is skipped on metadata-in-text indexes.
+
+## 4. Scripts and results
+
+- `qa.py` / `main.py`: `question_type` and `extras` passed to the retriever (agentic sub-questions too); hybrid mode keeps nodes of every layer in `top_k_scores`; results gain `retrieved_doc_ids_leaf_only`, `query_parses` and (with `save_retrieval_diagnostics`) `retrieval_diagnostics`. `run_tag` (`result_stem`) names results / logs / judge caches.
+- `experiments/make_splits.py` → `conf/enterprise_splits_s42.json` (dev 150 / test 350, stratified); `DataManager` honours `enterprise_split`.
+- `experiments/run_arms.py`: arms A0, C0, C1, C1r, C2, C3, C3t, D, B, BC3 on one loaded tree (shared dense matrix, one query embedding per question), retrieval metrics + per-type table, `--grid` re-scores the C3 candidate pools for 108 weight combinations, `--weights-from`, `--save-results`.
+
+## 5. Metadata-in-text index (arm B)
+
+`enterprise_chunk_metadata_prefix=True`: `document_text_header(doc)` replaces the title prefix in `finalize_chunks`; `RAG._write_metadata_into_abstracts` prepends the aggregated header to every abstract and re-embeds it; tree / BM25 names get `_metatext` (`conf/enterprise_rag_metatext.py`, `conf/enterprise_rag_smoke_metatext.py`).
+
+## 6. Evaluation (`src/evaluation.py`)
+
+`docmrr` (`DocMRR`), `docndcg` (`DocNDCG@5/10`), `DocRecallLeaf@k` from `retrieved_doc_ids_leaf_only`; all with `_by_type` breakdowns. Config defaults for every new key live in `conf/__init__.py` (metadata-aware retrieval section).
+
+## 7. Bug found on the way: stale `node.index` on layer-1 nodes
+
+`AbstractTreeBuilder._construct_tree_with_preset_chunks` re-keyed the document-level (layer-1) nodes past the leaves but left `node.index` at the *document position*, so `node.index` of every layer-1 node pointed at an unrelated leaf (800 / 17 203 nodes in the n800 tree). Invisible in legacy mode (layer-1 nodes are never returned), but any path that returns abstract nodes credited the wrong document. Fixed at the source (`src/tree_builder/abstract.py`) and repaired in memory for existing pickles by `src.utils.repair_node_indices` (called in `RAG.load`, `RAG.add_documents`, `TreeRetriever.__init__`).
+
+## 8. Field ablation (`experiments/run_arms.py --field-ablation`)
+
+Re-scores the reference arm's candidate pools with `S_metadata` restricted to one field (and to all-but-one), writing `field_ablation.{json,md}`; answers "which metadata field helps / hurts" without new API calls.
+
+## 9. Verification performed
+
+- `pytest tests -q` (fast) and `-m slow` (offline e2e incl. hybrid_score and the metatext index) pass; new tests: `test_query_understanding.py`, `test_scoring.py`, `test_retriever_hybrid.py`, `test_splits.py`, additions to `test_evaluation.py` / `test_e2e_smoke.py`.
+- Legacy regression: `qa.py --config enterprise_rag_smoke --run_tag smoke_legacy` reproduces the saved smoke results exactly; on the real n800 index 19 / 20 questions return identical `retrieved_doc_ids` (the 20th differs in the agentic second retrieval, whose sub-question is LLM-generated).
+- n800 dev / test splits (retrieval only): §10 below, full tables under `output/experiments/n800_{dev,test}[_b]/` (`table.md`, `grid.json`, `field_ablation.md`).
+
+## 10. Results on the n800 index (retrieval only, first retrieval, `rerank_top_k=10`)
+
+`*` weights selected on dev by `--grid`: `{'alpha': 1.0, 'beta': 0.5, 'gamma': 0.25, 'delta': 0.0, 'lambda': 0.3}` (dev R@5 0.9301). Arms: A0 legacy traversal+RRF · C0 collapsed dense+BM25, no metadata · C1 / C1r + S_metadata (LLM / rules parse) · C2 + S_level · C3 + redundancy (full soft score) · C3t traversal candidates · D hard filter · B metadata-in-text index, legacy retrieval · BC3 metadata-in-text + full soft score.
+
+**dev (150 questions)**
+
+| arm | R@1 | R@5 | R@10 | MRR | nDCG@10 | extra@5 | R@5 constrained | R@5 project_related | R@5 completeness |
+|---|---|---|---|---|---|---|---|---|---|
+| A0 | 0.5186 | 0.8729 | 0.884 | 0.7647 | 0.7703 | 2.6809 | 1.0 | 0.5729 | 0.5329 |
+| C0 | 0.7217 | 0.9168 | 0.9217 | 0.897 | 0.8782 | 1.9504 | 1.0 | 0.6042 | 0.5032 |
+| C1 | 0.7198 | 0.8831 | 0.8831 | 0.8764 | 0.8477 | 1.8582 | 0.8889 | 0.5312 | 0.3569 |
+| C1r | 0.7417 | 0.9012 | 0.902 | 0.9027 | 0.871 | 1.8227 | 0.8889 | 0.5602 | 0.3921 |
+| C2 | 0.741 | 0.8625 | 0.8696 | 0.8791 | 0.8471 | 1.9433 | 0.8889 | 0.5312 | 0.3736 |
+| C3 | 0.7417 | 0.8873 | 0.9014 | 0.8888 | 0.8692 | 2.773 | 0.9444 | 0.6968 | 0.3736 |
+| C3t | 0.7347 | 0.8955 | 0.9109 | 0.8862 | 0.8706 | 2.6879 | 0.9444 | 0.6968 | 0.4014 |
+| D | 0.7063 | 0.8352 | 0.8494 | 0.8516 | 0.8225 | 2.8652 | 0.8889 | 0.669 | 0.3736 |
+| B | 0.4504 | 0.8785 | 0.8971 | 0.7289 | 0.7523 | 2.6809 | 1.0 | 0.6192 | 0.5722 |
+| BC3 | 0.7347 | 0.9096 | 0.9397 | 0.8956 | 0.8878 | 3.0142 | 1.0 | 0.7211 | 0.4333 |
+
+**test (350 questions)**
+
+| arm | R@1 | R@5 | R@10 | MRR | nDCG@10 | extra@5 | R@5 constrained | R@5 project_related | R@5 completeness |
+|---|---|---|---|---|---|---|---|---|---|
+| A0 | 0.5486 | 0.8995 | 0.9106 | 0.7907 | 0.7989 | 2.5532 | 0.9524 | 0.6236 | 0.5342 |
+| C0 | 0.7785 | 0.9058 | 0.9124 | 0.9277 | 0.8974 | 1.9574 | 0.9524 | 0.6524 | 0.5172 |
+| C1 | 0.7813 | 0.9027 | 0.9111 | 0.9312 | 0.8966 | 1.8632 | 0.9524 | 0.5937 | 0.4557 |
+| C1r | 0.7874 | 0.9025 | 0.91 | 0.9348 | 0.899 | 1.8632 | 0.9286 | 0.6048 | 0.4642 |
+| C2 | 0.7813 | 0.9027 | 0.9111 | 0.9312 | 0.8966 | 1.8632 | 0.9524 | 0.5937 | 0.4557 |
+| C3 | 0.781 | 0.9132 | 0.926 | 0.9274 | 0.9058 | 2.8693 | 0.9762 | 0.7181 | 0.4879 |
+| C3t | 0.784 | 0.916 | 0.9324 | 0.9291 | 0.9098 | 2.8207 | 0.9762 | 0.7181 | 0.5189 |
+| D | 0.726 | 0.8416 | 0.8543 | 0.8622 | 0.8391 | 2.8906 | 0.8333 | 0.6546 | 0.5408 |
+| B | 0.5274 | 0.8905 | 0.906 | 0.7796 | 0.7918 | 2.4863 | 0.9524 | 0.6462 | 0.5272 |
+| BC3 | 0.7664 | 0.9278 | 0.9437 | 0.9253 | 0.9114 | 2.9666 | 0.9762 | 0.7627 | 0.5271 |
+
+**S_metadata field ablation on the test split** (C3 candidate pools, `S_metadata` restricted to one field; `n` = questions whose parse specifies that field)
+
+| label | n_questions_with_field | DocRecall@1 | DocRecall@5 | DocRecall@10 | DocMRR | DocNDCG@5 | DocNDCG@10 |
+|---|---|---|---|---|---|---|---|
+| no_metadata | 0 | 0.7755 | 0.924 | 0.9374 | 0.9258 | 0.9112 | 0.9106 |
+| all_fields | 185 | 0.781 | 0.9132 | 0.926 | 0.9274 | 0.9056 | 0.9058 |
+| only_source_type | 54 | 0.7728 | 0.9227 | 0.9351 | 0.9251 | 0.9114 | 0.9097 |
+| only_time | 39 | 0.7846 | 0.9245 | 0.9374 | 0.9316 | 0.9158 | 0.9149 |
+| only_projects | 95 | 0.7778 | 0.9182 | 0.9311 | 0.9263 | 0.9074 | 0.9073 |
+| only_entities | 63 | 0.7744 | 0.916 | 0.9274 | 0.9213 | 0.9022 | 0.9013 |
+| only_ticket_keys | 4 | 0.7755 | 0.9262 | 0.9389 | 0.9258 | 0.9127 | 0.9117 |
+
+What the numbers say (n800 = 722 gold documents + only 78 distractors, so constraints have little to separate):
+
+- The collapsed candidate pool with node-index dedup (C0) is the main gain over the legacy traversal (test MRR 0.928 vs 0.791, R@1 0.78 vs 0.55); it needs no metadata at all.
+- The soft metadata term does **not** raise overall recall (test R@5 C3 0.913 vs C0 0.906 comes from λ, not γ; dev is lower with γ>0). Per field, only `time` helps (MRR +0.006 on test); `source_type`, `entities`, `projects` hurt. Per question type, metadata helps `constrained` (0.976 vs 0.952) and `project_related` (0.718 vs 0.652) and hurts `completeness` (multi-document questions).
+- The level term (δ) trades R@5 for R@1 / MRR (document-level nodes get credited); redundancy (λ=0.3) helps consistently.
+- The hard filter (D) hurts everywhere (test R@5 0.842), even with source systems restricted to explicit names: questions describe the information, not the system, and document dates are often missing or broad. Relaxation never triggered (the pool stayed ≥ top_k).
+- The metadata-in-text index (B) alone ≈ legacy; BC3 vs C3 flips sign between dev (0.910 vs 0.930) and test (0.928 vs 0.913) — noise-level on this subset.
+- QA + LLM-judge runs of A0 / C0 / C3 / D / Cbest / B / BC3 on the test split (`experiments/qa_arms_n800.sh`, results as `output/results/enterprise_rag_<arm>.json`) were started; merge them with `python experiments/summarize_n800.py --config enterprise_rag --enterprise_subset_size 800 --split test --exp-dirs output/experiments/n800_test output/experiments/n800_test_b --qa-tags A0,C0,C3,D,Cbest,B,BC3` → `output/experiments/n800_summary_test.md`.
+
+## Files
+
+Modified: `CHANGES.md`, `README.md`, `conf/__init__.py`, `conf/enterprise_rag.py`, `conf/enterprise_rag_smoke.py`, `eval.py`, `main.py`, `qa.py`, `src/dataset.py`, `src/evaluation.py`, `src/metadata/__init__.py`, `src/metadata/aggregate.py`, `src/model/factory.py`, `src/rag.py`, `src/tree_builder/abstract.py`, `src/tree_retriever.py`, `src/utils.py`, `tests/test_e2e_smoke.py`, `tests/test_evaluation.py`
+New: `src/query/` (`understanding.py`, `time_expressions.py`, `scoring.py`, `candidates.py`, `credit.py`), `src/prompt/rag_query.py`, `experiments/` (`make_splits.py`, `run_arms.py`, `summarize_n800.py`, `qa_arms_n800.sh`), `conf/enterprise_rag_metatext.py`, `conf/enterprise_rag_smoke_metatext.py`, `conf/enterprise_splits_s42.json`, `tests/test_query_understanding.py`, `tests/test_scoring.py`, `tests/test_retriever_hybrid.py`, `tests/test_splits.py`
+Generated (not committed): `output/experiments/n800_{dev,test}[_b]/`, `output/*.dense.npz`, `output/query_cache/`, the n800 `_metatext` tree + BM25 index.
+
+## Next (not in this change)
+
+- The 5k-document indexes (plain + `_metatext`, ~1 h of API each) where time / source constraints have real distractors to separate.
+- Rethink `S_metadata` for multi-document (`completeness`) questions and entity-heavy parses (a per-type γ, or metadata as a re-ranking tie-breaker instead of an additive term).
+- The 800 layer-1 nodes of existing pickles are repaired at load time only; rebuild to persist the fix.
+
 # Change Record — 2026-09-02
 
 **Metadata-aware ingestion for EnterpriseRAG-Bench (phase 1: ingestion side).** Rule-based per-source metadata parsers, a `Document` registry, document provenance on leaf and abstract nodes, a reproducible parquet subset loader, provenance in retrieval results, and document-level / LLM-judge evaluation. Query-side understanding and the hybrid score (α·dense + β·BM25 + γ·metadata + δ·level − λ·redundancy) are deliberately **not** part of this change; the aggregated metadata they need is stored now.

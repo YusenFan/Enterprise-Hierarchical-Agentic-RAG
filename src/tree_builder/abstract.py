@@ -341,6 +341,8 @@ class AbstractTreeBuilder(TreeBuilder):
         tree = self._get_unionfind_tree(passage_node_emb)
 
         passage_level_nodes = {k + len(all_tree_nodes): v for k, v in passage_level_nodes.items()}
+        for key, node in passage_level_nodes.items():
+            node.index = key   # keys were shifted past the leaves; keep node.index == key
         tree = [nid + len(all_tree_nodes) if nid > 0 else nid for nid in tree]
         children = get_unionfind_children(tree)
         for father, children_list in children.items():

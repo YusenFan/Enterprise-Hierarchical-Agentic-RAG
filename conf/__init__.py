@@ -303,6 +303,55 @@ class Config(TypedDict, total=False):
     # Parallel judge calls.
     judge_workers: int
 
+    # ============================ Metadata-aware retrieval config ============================
+    # Retrieval pipeline. "legacy" = top-down tree traversal + BM25 fused by RRF / reranker
+    #   (bit-for-bit the original behaviour). "hybrid_score" = candidate generation over the tree
+    #   followed by the metadata-aware hybrid score
+    #   alpha*dense + beta*bm25 + gamma*metadata + delta*level - lambda*redundancy (MMR selection).
+    retrieve_mode: str
+    # Candidate generation for "hybrid_score": "collapsed" = dense top-N over every node of every
+    #   layer (cached normalised matrix) U BM25 top-N leaves; "traversal" = nodes visited by the
+    #   legacy top-down traversal U BM25 hits.
+    candidate_mode: str
+    candidate_dense_top_n: int
+    candidate_sparse_top_n: int
+    # Weights of the hybrid score: {"alpha","beta","gamma","delta","lambda"}.
+    score_weights: Dict[str, float]
+    # Per-query normalisation of the dense / BM25 terms over the candidate pool, ("minmax", "rank").
+    score_norm: str
+    # dtype of the cached dense matrix ("float32" or "float16").
+    dense_index_dtype: str
+    # Field weights of S_metadata (only fields present in the parsed query count).
+    metadata_field_weights: Dict[str, float]
+    # Days added on both sides of a query time window before matching document dates.
+    time_tolerance_days: int
+    # S_level: question_type -> {"0": w, "1": w, "2+": w} preference for leaf / document / cluster nodes.
+    level_preference: Dict[str, Dict[str, float]]
+    # Hard filter (arm D): drop nodes that contradict the high-precision constraints of the query.
+    metadata_filter: bool
+    hard_filter_fields: Sequence[str]
+    hard_time_tolerance_days: int
+    # Query understanding: "none" (no constraints), "rules" (dates / vocabulary / ticket regex),
+    #   "llm" (one JSON call to query_name, rules as fallback + augmentation, cached on disk).
+    query_understanding: str
+    # Chat model for query understanding (None -> reuse qa_name); cache dir (None -> <save_dir>/query_cache).
+    query_name: str | None
+    query_cache_dir: Path | None
+    query_model_kwargs: Dict
+    # Abstract nodes contribute their source documents to retrieved_doc_ids only when they cover
+    #   at most this many documents (None = no cap).
+    source_max_abstract_docs: int | None
+    # Store per-query parses and candidate sub-scores in the results file.
+    save_retrieval_diagnostics: bool
+    # Metadata-in-text index (arm B): write a metadata header into every chunk / abstract before
+    #   embedding and BM25 indexing. Index files get a "_metatext" tag.
+    enterprise_chunk_metadata_prefix: bool
+    # Evaluate only the "dev" or "test" question split (None = all questions).
+    enterprise_split: str | None
+    enterprise_split_file: Path
+    # Suffix for result / log / judge-cache file names so several variants of one config coexist.
+    run_tag: str | None
+
     # ===================================== Other config ======================================
     # Set of evaluation metrics, ("em", "f1", "rouge", "recall", "answerrate",
     #   "docrecall", "extradocs", "llmjudge"). The last three need EnterpriseRAG-Bench labels.
@@ -410,6 +459,39 @@ conf = Config(
     judge_cache_dir=None,
     judge_model_kwargs={},
     judge_workers=8,
+
+    retrieve_mode="legacy",
+    candidate_mode="collapsed",
+    candidate_dense_top_n=100,
+    candidate_sparse_top_n=100,
+    score_weights={"alpha": 1.0, "beta": 0.5, "gamma": 0.5, "delta": 0.3, "lambda": 0.3},
+    score_norm="minmax",
+    dense_index_dtype="float32",
+    metadata_field_weights={
+        "ticket_keys": 3.0, "time": 2.0, "source_type": 2.0, "projects": 2.0,
+        "entities": 1.5, "people": 1.5, "channels": 1.0,
+    },
+    time_tolerance_days=7,
+    level_preference={
+        "high_level": {"0": 0.2, "1": 0.6, "2+": 1.0},
+        "completeness": {"0": 0.2, "1": 0.6, "2+": 1.0},
+        "project_related": {"0": 0.8, "1": 0.8, "2+": 0.4},
+        "miscellaneous": {"0": 0.8, "1": 0.8, "2+": 0.4},
+        "default": {"0": 1.0, "1": 0.5, "2+": 0.0},
+    },
+    metadata_filter=False,
+    hard_filter_fields=["ticket_keys", "time", "source_type"],
+    hard_time_tolerance_days=14,
+    query_understanding="none",
+    query_name=None,
+    query_cache_dir=None,
+    query_model_kwargs={},
+    source_max_abstract_docs=3,
+    save_retrieval_diagnostics=False,
+    enterprise_chunk_metadata_prefix=False,
+    enterprise_split=None,
+    enterprise_split_file="./conf/enterprise_splits_s42.json",
+    run_tag=None,
 
     evaluation_metrics="all",
 

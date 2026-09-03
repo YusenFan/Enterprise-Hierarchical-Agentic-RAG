@@ -28,8 +28,12 @@ conf = {
     "sparse_top_k": 10,
     "rerank_top_k": 10,
     "context_metadata_header": True,
+    # Query understanding for the metadata-aware arms (cached per question under save_dir/query_cache).
+    # retrieve_mode stays "legacy" here (arm A); the other arms override it (--retrieve_mode hybrid_score ...).
+    "query_understanding": "llm",
+    "query_name": "api:gpt-4o-mini",
 
-    "evaluation_metrics": ["docrecall", "extradocs", "llmjudge", "f1", "rouge", "answerrate"],
+    "evaluation_metrics": ["docrecall", "docmrr", "docndcg", "extradocs", "llmjudge", "f1", "rouge", "answerrate"],
     "multithreading_qa_batch_size": 8,
     "verbose": False,
 }

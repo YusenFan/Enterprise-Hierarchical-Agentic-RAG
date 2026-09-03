@@ -8,7 +8,7 @@ from conf import apply_config_overrides, read_config
 from src import DataManager, Evaluator
 from src.dataset import enterprise_kwargs_from_conf, split_dataset
 from src.model.factory import build_model
-from src.utils import get_token_length, load_answers
+from src.utils import get_token_length, load_answers, result_stem
 
 
 def build_judge(conf):
@@ -48,7 +48,7 @@ def main():
         else conf["tree_top_k"]
     )
     judge_cache_path = (
-        os.path.join(conf["save_dir"], "results", f'{conf["config"]}_judge.json')
+        os.path.join(conf["save_dir"], "results", f"{result_stem(conf)}_judge.json")
         if conf["save_dir"] is not None else None
     )
     evaluator = Evaluator(
@@ -74,6 +74,7 @@ def main():
         answers=results.get("answers", None),
         retrieved_docs=results.get("retrieved_docs", None),
         retrieved_doc_ids=results.get("retrieved_doc_ids", None),
+        retrieved_doc_ids_leaf_only=results.get("retrieved_doc_ids_leaf_only", None),
         metrics=conf["evaluation_metrics"],
     )
 

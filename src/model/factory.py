@@ -3,8 +3,8 @@ Single place that maps "<platform>:<model>" config names to backend classes.
 
 Platforms: "ollama", "transformers", "sentence-transformers", "vllm", "api" (OpenAI-compatible),
 plus the offline "hash" (embedding) and "fake" (abstract / qa) backends used by tests and smoke runs.
-Task types: "embed", "abs", "qa", "rerank", "judge" ("judge" reuses the qa classes and reads
-judge_model_kwargs / judge_cache_dir).
+Task types: "embed", "abs", "qa", "rerank", "judge", "query" ("judge" / "query" reuse the qa
+classes and read judge_* / query_* model kwargs and cache dirs).
 """
 from typing import Any, Dict
 
@@ -60,7 +60,7 @@ def build_model(model_name: str, task_type: str, conf: Dict[str, Any]):
             f'e.g. "api:gpt-4o-mini" or "hash:bow".'
         )
     framework, name = model_name.split(":", maxsplit=1)
-    class_task = "qa" if task_type == "judge" else task_type
+    class_task = "qa" if task_type in ("judge", "query") else task_type
     try:
         model_class = MODEL_CLASSES[framework][class_task]
     except KeyError:

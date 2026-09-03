@@ -32,6 +32,7 @@ from src import (
 )
 from src.dataset import enterprise_kwargs_from_conf, split_dataset
 from src.metadata import collect_sources
+from src.query.credit import document_credit, merge_node_scores
 from src.model.factory import build_model
 from src.prompt import AgentPrompt, get_qa_template
 from src.utils import (
@@ -39,6 +40,7 @@ from src.utils import (
     load_answers,
     parse_response,
     save_answers,
+    result_stem,
     is_bucketed_tree,
     get_tree_save_name,
     remove_tree_target,
@@ -72,8 +74,11 @@ def main():
         if conf["rerank_top_k"] is not None
         else conf["tree_top_k"]
     )
+    hybrid_mode = conf.get("retrieve_mode") == "hybrid_score"
+    if hybrid_mode and conf["rerank_top_k"] is not None:
+        top_k = conf["rerank_top_k"]   # hybrid_score returns rerank_top_k nodes of any layer
     judge_cache_path = (
-        os.path.join(conf["save_dir"], "results", f'{conf["config"]}_judge.json')
+        os.path.join(conf["save_dir"], "results", f"{result_stem(conf)}_judge.json")
         if conf["save_dir"] is not None else None
     )
     evaluator = Evaluator(
@@ -85,7 +90,7 @@ def main():
 
     if not os.path.exists(conf["log_path"]):
         os.makedirs(conf["log_path"])
-    logger = open(os.path.join(conf["log_path"], f'{conf["config"]}.log'), "a")
+    logger = open(os.path.join(conf["log_path"], f"{result_stem(conf)}.log"), "a")
 
     results = None
     if conf["save_dir"] is not None:
@@ -183,10 +188,11 @@ def main():
         all_answers = {}
         all_contexts = {}
         all_sources = {}
+        all_diag = {}
 
         def sources_for(top_k_scores, query_id):
             tree = tree_rag.tree[data.query_to_doc_ids[query_id]] if isinstance(tree_rag.tree, List) else tree_rag.tree
-            return collect_sources(tree, top_k_scores)
+            return document_credit(tree, top_k_scores, conf.get("source_max_abstract_docs"))
 
         def get_max_retrieval_time_verbose_lines(query_id, predicted_hop_label):
             if conf["max_retrieval_time"] != "auto" or not conf["verbose"]:
@@ -245,7 +251,7 @@ def main():
                     tqdm.write(output)
                 logger.write(output)
 
-                return query_id, answer, context, qa_time, []
+                return query_id, answer, context, qa_time, [], {}
 
             if conf["max_retrieval_time"] == "auto":
                 query_embedding = conf["embed_model"].embed(query)
@@ -264,11 +270,15 @@ def main():
                     'max_retrieval_time must be an integer or "auto".'
                 )
 
+            question_type = data.question_types[query_id] if getattr(data, "question_types", None) else None
+            retrieval_extras = [{}]
             documents, layer_information = tree_rag.retrieve(
                 query,
                 data.query_to_doc_ids[query_id],
                 tokenizer_lock=tokenizer_lock,
                 query_embedding=query_embedding,
+                extras=retrieval_extras[0],
+                question_type=question_type,
             )
 
             def get_agentic_answer(query, documents, state_log, response=None):
@@ -284,10 +294,13 @@ def main():
                     return info
                 if action == "retrieve":
                     state_log["subquestion"].append(info)
+                    retrieval_extras.append({})
                     documents, layer_information = tree_rag.retrieve(
                         info,
                         data.query_to_doc_ids[query_id],
                         tokenizer_lock=tokenizer_lock,
+                        extras=retrieval_extras[-1],
+                        question_type=question_type,
                     )
                     state_log["retrieved_nodes"].append(layer_information)
                     return get_agentic_answer(query, documents, state_log, response)
@@ -309,20 +322,7 @@ def main():
                 answer = get_agentic_answer(query, documents, state_log)
                 qa_time = time.time() - start_time
 
-                top_k_scores = {}
-                for layer_information in state_log["retrieved_nodes"]:
-                    for node in layer_information:
-                        if node["layer_number"] != 0:
-                            continue
-                        node_index = node["node_index"]
-                        node_score = node["score"]
-                        if node_index in top_k_scores and node_score > top_k_scores[node_index]:
-                            top_k_scores[node_index] = node_score
-                        else:
-                            top_k_scores.setdefault(node_index, node_score)
-                top_k_scores = dict(
-                    sorted(top_k_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-                )
+                top_k_scores = merge_node_scores(state_log["retrieved_nodes"], top_k, all_layers=hybrid_mode)
                 if isinstance(tree_rag.tree, List):
                     context = [
                         tree_rag.tree[data.query_to_doc_ids[query_id]].all_nodes[top_k_node_index].text
@@ -334,7 +334,7 @@ def main():
                         for top_k_node_index in top_k_scores.keys()
                     ]
 
-                sources = sources_for(top_k_scores, query_id)
+                sources, sources_leaf = sources_for(top_k_scores, query_id)
                 subquestions_text = "\n\t".join(state_log["subquestion"][1:])
                 thoughts_text = "\n\t".join(state_log["thought"])
                 output = "\n".join(
@@ -373,13 +373,7 @@ def main():
 
                 qa_time = time.time() - start_time
 
-                top_k_scores = {}
-                for node in layer_information:
-                    if node["layer_number"] == 0:
-                        top_k_scores[node["node_index"]] = node["score"]
-                top_k_scores = dict(
-                    sorted(top_k_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-                )
+                top_k_scores = merge_node_scores([layer_information], top_k, all_layers=hybrid_mode)
                 if isinstance(tree_rag.tree, List):
                     context = [
                         tree_rag.tree[data.query_to_doc_ids[query_id]].all_nodes[top_k_node_index].text
@@ -392,7 +386,7 @@ def main():
                     ]
                 while len(context) < top_k:
                     context.append("")
-                sources = sources_for(top_k_scores, query_id)
+                sources, sources_leaf = sources_for(top_k_scores, query_id)
 
                 output = "\n".join(
                     [
@@ -411,7 +405,12 @@ def main():
                 tqdm.write(output)
             logger.write(output)
 
-            return query_id, answer, context, qa_time, sources
+            diag = {
+                "sources_leaf_only": sources_leaf,
+                "query_parses": [e.get("query_parse") for e in retrieval_extras if e],
+                "retrieval": retrieval_extras if conf.get("save_retrieval_diagnostics") else None,
+            }
+            return query_id, answer, context, qa_time, sources, diag
 
         tqdm.write("Answering questions...")
         if conf["multithreading_qa_batch_size"] > 1:
@@ -439,16 +438,18 @@ def main():
                         )
                     ]
                     for future in as_completed(future_qa_results):
-                        query_id, answer, context, qa_time, sources = future.result()
+                        query_id, answer, context, qa_time, sources, diag = future.result()
                         all_answers[query_id] = answer
+                        all_diag[query_id] = diag
                         all_contexts[query_id] = context
                         all_sources[query_id] = sources
                         all_qa_time.append(qa_time)
         else:
             bar = tqdm(data.all_queries, desc="qa")
             for query_id, query in enumerate(bar):
-                _, answer, context, qa_time, sources = qa(query, query_id)
+                _, answer, context, qa_time, sources, diag = qa(query, query_id)
                 all_answers[query_id] = answer
+                all_diag[query_id] = diag
                 all_contexts[query_id] = context
                 all_sources[query_id] = sources
                 all_qa_time.append(qa_time)
@@ -460,12 +461,18 @@ def main():
             "retrieved_docs": [cont[1] for cont in sorted(all_contexts.items())],
             "sources": [src[1] for src in sorted(all_sources.items())],
             "retrieved_doc_ids": [[s["document_id"] for s in src[1]] for src in sorted(all_sources.items())],
+            "retrieved_doc_ids_leaf_only": [
+                [s["document_id"] for s in all_diag[q].get("sources_leaf_only", [])] for q in sorted(all_diag)
+            ],
+            "query_parses": [all_diag[q].get("query_parses") for q in sorted(all_diag)],
             "time": {
                 "tb_time": tree_rag.tb_time if tree_rag is not None else -1,
                 "tr_time": tree_rag.tr_time if tree_rag is not None else -1,
                 "qa_time": sum(all_qa_time) / len(all_qa_time),
             },
         }
+        if conf.get("save_retrieval_diagnostics"):
+            results["retrieval_diagnostics"] = [all_diag[q].get("retrieval") for q in sorted(all_diag)]
         if conf["save_dir"] is not None:
             ans_path = os.path.join(conf["save_dir"], "results")
             save_answers(conf, results, ans_path)
@@ -495,6 +502,7 @@ def main():
         answers=results.get("answers", None),
         retrieved_docs=results.get("retrieved_docs", None),
         retrieved_doc_ids=results.get("retrieved_doc_ids", None),
+        retrieved_doc_ids_leaf_only=results.get("retrieved_doc_ids_leaf_only", None),
         metrics=metrics,
     )
 

@@ -84,3 +84,49 @@ def test_llm_judge_with_cache(tmp_path):
     ev.judge_model = None
     ev.judge_model = type("Broken", (), {"qa": lambda self, question, **k: "garbage"})()
     assert ev.qa_llm_judge(["right", "wrong", "right", "right"])["JudgeOverall"] == out["JudgeOverall"]
+
+
+# ---------------------------------------------------------------- phase 2: ranked document metrics
+
+class _Data:
+    def __init__(self, gold, types=None):
+        self.gold_doc_ids = gold
+        self.question_types = types
+
+
+def test_doc_mrr_and_ndcg_and_leaf_only():
+    from src.evaluation import Evaluator
+    data = _Data([["a", "b"], ["c"], []], ["basic", "constrained", "high_level"])
+    ev = Evaluator(data=data, top_k_nodes_per_layer=10)
+    ranked = [["x", "a", "b"], ["c", "y"], ["z"]]
+    mrr = ev.rt_doc_mrr(ranked)
+    assert mrr["DocMRR"] == 0.75 and mrr["DocMRR_by_type"]["basic"]["DocMRR"] == 0.5
+    ndcg = ev.rt_doc_ndcg(ranked)
+    import numpy as np
+    expected_q1 = (1 / np.log2(3) + 1 / np.log2(4)) / (1 + 1 / np.log2(3))
+    assert abs(ndcg["DocNDCG@5"] - (expected_q1 + 1.0) / 2) < 1e-4
+    assert "DocNDCG@10" in ndcg and "high_level" not in ndcg["DocNDCG_by_type"]
+    leaf = ev.rt_doc_recall_leaf_only([["a"], ["y"], []])
+    assert leaf["DocRecallLeaf@1"] == 0.25 and leaf["DocRecallLeaf@all"] == 0.25
+    scores = ev.evaluate(retrieved_doc_ids=ranked, retrieved_doc_ids_leaf_only=[["a"], ["y"], []],
+                         metrics=["docrecall", "docmrr", "docndcg"])
+    assert {"DocRecall@1", "DocMRR", "DocNDCG@5", "DocRecallLeaf@1"} <= set(scores)
+
+
+def test_collect_sources_abstract_cap():
+    from src.metadata import aggregate_tree_metadata, collect_sources
+    from src.query.credit import document_credit, merge_node_scores
+    from tests.test_aggregate import build_tree
+    tree, registry = build_tree()
+    aggregate_tree_metadata(tree, registry)
+    ids = lambda rows: [r["document_id"] for r in rows]
+    assert ids(collect_sources(tree, {6: 0.9, 0: 0.5})) == ["doc_a", "doc_b"]
+    assert ids(collect_sources(tree, {6: 0.9, 0: 0.5}, max_abstract_docs=1)) == ["doc_a"]
+    assert ids(collect_sources(tree, {5: 0.9, 0: 0.5}, max_abstract_docs=1)) == ["doc_b", "doc_a"]
+    sources, leaf_only = document_credit(tree, {5: 0.9, 0: 0.5, 6: 0.95}, max_abstract_docs=1)
+    assert ids(sources) == ["doc_b", "doc_a"] and ids(leaf_only) == ["doc_a"]
+    infos = [[{"node_index": 0, "layer_number": 0, "score": 0.2}, {"node_index": 5, "layer_number": 1, "score": 0.9}],
+             [{"node_index": 0, "layer_number": 0, "score": 0.6}]]
+    assert merge_node_scores(infos, 5) == {0: 0.6}
+    assert merge_node_scores(infos, 5, all_layers=True) == {5: 0.9, 0: 0.6}
+    assert list(merge_node_scores(infos, 1, all_layers=True)) == [5]

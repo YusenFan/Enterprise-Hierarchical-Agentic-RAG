@@ -308,6 +308,64 @@ class Evaluator:
         results["InvalidExtraDocs_by_type"] = self._by_question_type(per_example)
         return results
 
+    def _ranked_doc_metric(self, retrieved_doc_ids: List[List[str]], name: str, fn) -> Dict:
+        """Shared loop for document-level metrics; fn(ranked, gold_set) -> {metric: value}."""
+        gold_lists = self.data.gold_doc_ids
+        assert gold_lists is not None, f"{name} needs data.gold_doc_ids."
+        assert len(gold_lists) == len(retrieved_doc_ids), \
+            "Length of gold document ids and retrieved document ids should be the same."
+        per_example: Dict[str, List[Optional[float]]] = defaultdict(list)
+        keys: List[str] = []
+        for gold, retrieved in zip(gold_lists, retrieved_doc_ids):
+            gold_set = set(gold or [])
+            values = fn(list(dict.fromkeys(retrieved or [])), gold_set) if gold_set else None
+            if values is not None and not keys:
+                keys = list(values.keys())
+            for key in (keys or (list(values.keys()) if values else [])):
+                per_example[key].append(None if values is None else values[key])
+        results = {}
+        for metric, values in per_example.items():
+            valid = [v for v in values if v is not None]
+            results[metric] = round(float(np.mean(valid)), 4) if valid else 0.0
+        results[f"{name}_by_type"] = self._by_question_type(dict(per_example))
+        return results
+
+    def rt_doc_mrr(self, retrieved_doc_ids: List[List[str]]) -> Dict:
+        """Mean reciprocal rank of the first gold document (questions without gold docs skipped)."""
+        def fn(ranked, gold_set):
+            for rank, doc in enumerate(ranked, 1):
+                if doc in gold_set:
+                    return {"DocMRR": 1.0 / rank}
+            return {"DocMRR": 0.0}
+        return self._ranked_doc_metric(retrieved_doc_ids, "DocMRR", fn)
+
+    def rt_doc_ndcg(self, retrieved_doc_ids: List[List[str]]) -> Dict:
+        """nDCG@k with binary gains over gold documents, k in {5, 10} (capped by the ranked list)."""
+        ks = [k for k in (5, 10) if k <= max(self.doc_k_list[:-1] or [10])] or [5]
+
+        def fn(ranked, gold_set):
+            out = {}
+            for k in ks:
+                dcg = sum(1.0 / np.log2(i + 2) for i, doc in enumerate(ranked[:k]) if doc in gold_set)
+                idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(gold_set), k)))
+                out[f"DocNDCG@{k}"] = dcg / idcg if idcg > 0 else 0.0
+            return out
+        return self._ranked_doc_metric(retrieved_doc_ids, "DocNDCG", fn)
+
+    def rt_doc_recall_leaf_only(self, retrieved_doc_ids: List[List[str]]) -> Dict:
+        """DocRecall computed on leaf-only document ids (abstract nodes ignored), keys suffixed "Leaf"."""
+        results = self.rt_doc_recall(retrieved_doc_ids)
+        out = {}
+        for key, value in results.items():
+            if key.startswith("DocRecall_"):
+                continue
+            out[key.replace("DocRecall@", "DocRecallLeaf@")] = value
+        out["DocRecallLeaf_by_type"] = {
+            qtype: {k.replace("DocRecall@", "DocRecallLeaf@"): v for k, v in metrics.items()}
+            for qtype, metrics in results.get("DocRecall_by_type", {}).items()
+        }
+        return out
+
     def _load_judge_cache(self) -> Dict:
         if self.judge_cache_path and os.path.exists(self.judge_cache_path):
             try:
@@ -377,10 +435,11 @@ class Evaluator:
         }
 
     def evaluate(self, answers: List[str] = None, retrieved_docs: List[List[str]] = None, 
-                 metrics: str | Tuple[str] = "all", retrieved_doc_ids: List[List[str]] = None) -> Dict:
+                 metrics: str | Tuple[str] = "all", retrieved_doc_ids: List[List[str]] = None,
+                 retrieved_doc_ids_leaf_only: List[List[str]] = None) -> Dict:
 
         implemented_metrics = set(["em", "f1", "rouge", "rsim", "recall", "answerrate", "llmjudge",
-                                   "docrecall", "extradocs"])
+                                   "docrecall", "extradocs", "docmrr", "docndcg"])
         if metrics == "all":
             metrics = implemented_metrics
         elif isinstance(metrics, (list, tuple, set)):
@@ -419,5 +478,11 @@ class Evaluator:
                 run("docrecall", self.rt_doc_recall, retrieved_doc_ids=retrieved_doc_ids)
             if "extradocs" in metrics:
                 run("extradocs", self.rt_invalid_extra_docs, retrieved_doc_ids=retrieved_doc_ids)
+            if "docmrr" in metrics:
+                run("docmrr", self.rt_doc_mrr, retrieved_doc_ids=retrieved_doc_ids)
+            if "docndcg" in metrics:
+                run("docndcg", self.rt_doc_ndcg, retrieved_doc_ids=retrieved_doc_ids)
+            if "docrecall" in metrics and retrieved_doc_ids_leaf_only is not None:
+                run("docrecall_leaf", self.rt_doc_recall_leaf_only, retrieved_doc_ids=retrieved_doc_ids_leaf_only)
             
         return overall_results

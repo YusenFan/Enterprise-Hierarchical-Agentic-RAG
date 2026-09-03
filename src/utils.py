@@ -77,6 +77,23 @@ class Tree:
             self.documents = documents
 
 
+def repair_node_indices(tree: "Tree") -> int:
+    """
+    Make every node's `.index` equal to its key in `tree.all_nodes`. Trees built with preset
+    chunks used to keep the *document position* as the index of layer-1 nodes, so any code that
+    reads `node.index` (retrieval provenance, document credit) pointed at an unrelated leaf.
+    Returns the number of repaired nodes. Idempotent; safe on every builder's output.
+    """
+    repaired = 0
+    for key, node in tree.all_nodes.items():
+        if node.index != key:
+            node.index = key
+            repaired += 1
+    if repaired:
+        logging.warning(f"repair_node_indices: {repaired} nodes had a stale .index (fixed in memory).")
+    return repaired
+
+
 def reverse_mapping(layer_to_node_indices: Dict[int, List[int]]) -> Dict[int, int]:
     node_to_layer = {}
     for layer, nodes in layer_to_node_indices.items():
@@ -695,6 +712,8 @@ def get_tree_save_name(conf: Dict) -> str:
     )
     if conf.get("chunking") == "semantic":
         prefix = f"{prefix}_semantic"
+    if conf.get("enterprise_chunk_metadata_prefix"):
+        prefix = f"{prefix}_metatext"
     tree_builder = conf.get("tree_builder", "exact")
 
     if is_bucketed_tree(conf):
@@ -709,6 +728,8 @@ def get_sparse_save_name(conf: Dict) -> str:
     name = f"bm25_{dataset_tag(conf)}"
     if conf.get("chunking") == "semantic":
         name = f"{name}_semantic"
+    if conf.get("enterprise_chunk_metadata_prefix"):
+        name = f"{name}_metatext"
     return name
 
 
@@ -823,12 +844,24 @@ def rrf(docs: List[List[str]], top_k: int = 5, k: int = 60) -> Tuple[List[str], 
     return list(node_scoring_sheet.keys())[:top_k], list(node_scoring_sheet.values())[:top_k]
 
 
+def result_stem(conf: Dict) -> str:
+    """
+    Base name of result / log / judge-cache files: "<config>" or "<config>_<run_tag>" so several
+    retrieval variants of one config can coexist (used by qa.py, main.py, eval.py, run_arms.py).
+    """
+    stem = str(conf["config"])
+    run_tag = conf.get("run_tag")
+    if run_tag:
+        stem = f"{stem}_{sanitize_save_name(str(run_tag)).replace(' ', '_')}"
+    return stem
+
+
 def save_answers(conf: Dict, results: Dict, ans_path: Path, single_query: bool = False, verbose: bool = False) -> None:
     if not single_query:
         results["conf"] = repr(conf)
     if not os.path.exists(ans_path):
         os.makedirs(ans_path)
-    file_name = f"{conf['config']}_query.json" if single_query else f"{conf['config']}.json"
+    file_name = f"{result_stem(conf)}_query.json" if single_query else f"{result_stem(conf)}.json"
     ans_file = os.path.join(ans_path, file_name)
     with open(ans_file, "w") as f:
         json.dump(results, f)
@@ -841,7 +874,7 @@ def load_answers(conf: Dict, single_query: bool = False) -> None | Tuple[List[st
     if conf["save_dir"] is None and single_query:
         return {}
 
-    file_name = f"{conf['config']}_query.json" if single_query else f"{conf['config']}.json"
+    file_name = f"{result_stem(conf)}_query.json" if single_query else f"{result_stem(conf)}.json"
     ans_file = os.path.join(conf["save_dir"], "results", file_name)
     if not os.path.exists(ans_file):
         logging.info("No answer file detected. Running from scratch.")

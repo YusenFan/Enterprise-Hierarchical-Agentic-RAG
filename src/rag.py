@@ -12,9 +12,9 @@ from .tree_builder import (
     load_tree_chunks,
     save_tree_chunks,
 )
-from .metadata.aggregate import aggregate_tree_metadata
+from .metadata.aggregate import aggregate_tree_metadata, format_context_header
 from .tree_retriever import TreeRetriever
-from .utils import Tree
+from .utils import Tree, repair_node_indices
 
 logging.basicConfig(format="%(asctime)s - %(message)s", 
                     level=logging.INFO,
@@ -41,7 +41,7 @@ class RAG:
             self.retriever = None
 
         self.retrieve_count = 0
-        self.time_dict = {'tree': 0.0, 'sparse': 0.0, 'rerank': 0.0}
+        self.time_dict = {'tree': 0.0, 'sparse': 0.0, 'rerank': 0.0, 'parse': 0.0, 'score': 0.0}
 
     def _is_bucketed_tree(self) -> bool:
         return self.conf.get("bucket_size") is not None
@@ -81,6 +81,8 @@ class RAG:
                 document_ids=getattr(data, "all_text_ids", None) if registry else None,
                 chunk_metadata=getattr(data, "chunk_local_metadata", None) if registry else None,
             )
+        for tree in (self.tree if isinstance(self.tree, List) else [self.tree]):
+            repair_node_indices(tree)
         if registry and not isinstance(self.tree, List):
             # Single post-pass: leaves already carry document_id; abstract nodes get
             # source_refs / source_document_ids / aggregated_metadata for every builder.
@@ -89,7 +91,31 @@ class RAG:
                 registry,
                 source_authority=self.conf.get("enterprise_source_authority"),
             )
+            if self.conf.get("enterprise_chunk_metadata_prefix"):
+                self._write_metadata_into_abstracts()
         self._init_retrievers()
+
+    def _write_metadata_into_abstracts(self) -> None:
+        """
+        Metadata-in-text index (arm B): prepend the aggregated-metadata header to every abstract
+        node's text and re-embed those nodes, so the summaries carry provenance the same way the
+        leaves do. Clustering already happened on the header-less embeddings (documented limitation).
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        abstracts = [node for node in self.tree.all_nodes.values() if node.children]
+        for node in abstracts:
+            header = format_context_header(node)
+            if not node.text.startswith(header):
+                node.text = f"{header}\n{node.text}"
+        embed = self.conf["embed_model"].embed
+        load_model = getattr(self.conf["embed_model"], "load_model", None)
+        if callable(load_model):
+            load_model()
+            embed("warm up")
+        with ThreadPoolExecutor() as executor:
+            for node, embedding in zip(abstracts, executor.map(lambda n: embed(n.text), abstracts)):
+                node.embeddings = embedding
+        logging.info(f"Metadata header written into {len(abstracts)} abstract nodes and re-embedded.")
 
     def build_vocab(self, data):
         if isinstance(self.retriever, List):
@@ -111,7 +137,7 @@ class RAG:
             retrieved_documents, layer_information, self.tr_time, time_dict = self.retriever.retrieve(question, **kwargs)
 
         for k, v in time_dict.items():
-            self.time_dict[k] += v
+            self.time_dict[k] = self.time_dict.get(k, 0.0) + v
 
         return retrieved_documents, layer_information
 
@@ -145,6 +171,8 @@ class RAG:
             with open(path, 'rb') as file:
                 setattr(self, name, pickle.load(file))
         if name == "tree":
+            for tree in (self.tree if isinstance(self.tree, List) else [self.tree]):
+                repair_node_indices(tree)
             self._init_retrievers()
         logging.info(f"{name} successfully loaded to {path}")
 

@@ -9,7 +9,7 @@ from tqdm import tqdm
 import numpy as np
 
 from .enterprise_rag import load_enterprise_rag
-from .metadata import Document, ProjectVocabulary, get_parser
+from .metadata import Document, ProjectVocabulary, document_text_header, get_parser
 from .pdf import load_local_pdf_data
 from .utils import split_text, split_sentences, chunk_sentences_semantic
 
@@ -60,6 +60,7 @@ class DataManager:
         self.data_path: str | None = None 
         self.corpus: str | List[str] | List[Dict[str, Any]] | None = None
         self.load_data(data_dir, **pdf_kwargs)
+        self._apply_enterprise_split()
 
         # ------------------- FOR QA TESTING ONLY -------------------
         if test_samples > 0:
@@ -83,6 +84,27 @@ class DataManager:
         self.all_text_ids: List[str] = []
         self.all_passages: List[str] | List[List[str]] = []
         self.preprocess()
+
+    def _apply_enterprise_split(self) -> None:
+        """Keep only the questions of the configured dev / test split (enterprise_kwargs["split"])."""
+        split = (self.enterprise_kwargs or {}).get("split")
+        if not self.is_enterprise or not split or self.data is None:
+            return
+        split_file = self.enterprise_kwargs.get("split_file")
+        if not split_file or not os.path.exists(split_file):
+            raise FileNotFoundError(
+                f'Question split file "{split_file}" not found. Run "python experiments/make_splits.py" first.'
+            )
+        with open(split_file, "r", encoding="utf-8") as f:
+            splits = json.load(f)
+        if split not in splits:
+            raise ValueError(f'Split "{split}" not in {sorted(k for k in splits if k != "meta")} of "{split_file}".')
+        keep = set(splits[split])
+        before = len(self.data)
+        self.data = [sample for sample in self.data if sample.get("question_id") in keep]
+        self.subset_stats = dict(self.subset_stats or {}, split=split, split_questions=len(self.data),
+                                 all_questions=before)
+        logging.info(f'Enterprise split "{split}": {len(self.data)} / {before} questions kept.')
 
     def load_data(self, data_dir: str = "./data", **pdf_kwargs) -> None:
         try:
@@ -264,11 +286,13 @@ class DataManager:
             self.all_passages.append(text)  # List[str]; chunked later by split_dataset()
         bar.close()
 
-    def finalize_chunks(self, title_prefix: bool = True) -> None:
+    def finalize_chunks(self, title_prefix: bool = True, metadata_prefix: bool = False) -> None:
         """
         Called once the passages are chunked (List[List[str]]): computes chunk-level
         `local_metadata` and optionally prefixes every chunk with the document title so that
         channel / account / ticket titles reach every chunk (tree text and BM25 text stay identical).
+        `metadata_prefix` (metadata-in-text index) writes a "[source | title | date | who | ...]"
+        header instead of the bare title.
         """
         if not self.documents:
             return
@@ -281,7 +305,10 @@ class DataManager:
             parser = get_parser(doc.source_type)
             state: Dict[str, Any] = {}
             self.chunk_local_metadata.append([parser.local_metadata(chunk, doc, state) for chunk in chunks])
-            if title_prefix and doc.title:
+            if metadata_prefix:
+                header = document_text_header(doc)
+                chunks[:] = [f"{header}\n{chunk}" for chunk in chunks]
+            elif title_prefix and doc.title:
                 chunks[:] = [f"{doc.title}\n{chunk}" for chunk in chunks]
             doc.num_chunks = len(chunks)
 
@@ -533,6 +560,8 @@ def enterprise_kwargs_from_conf(conf: Dict) -> Dict[str, Any]:
         "seed": conf.get("enterprise_subset_seed", 42),
         "cache_dir": conf.get("enterprise_subset_cache_dir"),
         "project_vocab": conf.get("enterprise_project_vocab"),
+        "split": conf.get("enterprise_split"),
+        "split_file": conf.get("enterprise_split_file"),
     }
 
 
@@ -593,7 +622,8 @@ def split_dataset(data: DataManager, conf: Dict) -> None:
     if recorder is not None:
         report_chunking_diagnostics(recorder, conf)
     if getattr(data, "documents", None):
-        data.finalize_chunks(title_prefix=bool(conf.get("enterprise_chunk_title_prefix", True)))
+        data.finalize_chunks(title_prefix=bool(conf.get("enterprise_chunk_title_prefix", True)),
+                             metadata_prefix=bool(conf.get("enterprise_chunk_metadata_prefix", False)))
 
 
 def report_chunking_diagnostics(recorder: Dict, conf: Dict) -> None:
